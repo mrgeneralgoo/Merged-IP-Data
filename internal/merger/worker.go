@@ -420,6 +420,8 @@ func (ctx *workerContext) enrichWithProxyData(ip net.IP, record *MergedRecord) {
 		}
 	}
 
+	applySchoolASNMatch(record)
+
 	if !record.Proxy.IsProxy && record.ASN.Number != 0 && ctx.badASN.Contains(record.ASN.Number) {
 		ctx.stats.badASNHits++
 		record.Proxy.IsProxy = true

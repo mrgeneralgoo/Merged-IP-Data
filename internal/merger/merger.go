@@ -800,6 +800,8 @@ func (m *Merger) enrichWithProxyData(ip net.IP, record *MergedRecord) {
 		}
 	}
 
+	applySchoolASNMatch(record)
+
 	if !record.Proxy.IsProxy && record.ASN.Number != 0 && m.badASN.Contains(record.ASN.Number) {
 		m.stats.BadASNHits++
 		record.Proxy.IsProxy = true

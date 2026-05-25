@@ -13,3 +13,44 @@ func TestWithNameClonesInput(t *testing.T) {
 		t.Fatalf("updated = %#v, want original and added names", updated)
 	}
 }
+func TestApplySchoolASNMatchMarksUniversityOrganization(t *testing.T) {
+	record := MergedRecord{
+		ASN: ASNRecord{
+			Organization: "Example State University",
+		},
+	}
+
+	applySchoolASNMatch(&record)
+
+	if !record.Proxy.IsSchool {
+		t.Fatalf("proxy = %+v, want school", record.Proxy)
+	}
+}
+
+func TestApplySchoolASNMatchMarksSchoolOrganizationCaseInsensitive(t *testing.T) {
+	record := MergedRecord{
+		ASN: ASNRecord{
+			Organization: "EXAMPLE SCHOOL DISTRICT",
+		},
+	}
+
+	applySchoolASNMatch(&record)
+
+	if !record.Proxy.IsSchool {
+		t.Fatalf("proxy = %+v, want school", record.Proxy)
+	}
+}
+
+func TestApplySchoolASNMatchIgnoresOtherOrganizations(t *testing.T) {
+	record := MergedRecord{
+		ASN: ASNRecord{
+			Organization: "Example Hosting LLC",
+		},
+	}
+
+	applySchoolASNMatch(&record)
+
+	if record.Proxy.IsSchool {
+		t.Fatalf("proxy = %+v, want not school", record.Proxy)
+	}
+}
