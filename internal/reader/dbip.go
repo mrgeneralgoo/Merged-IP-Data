@@ -8,14 +8,14 @@ import (
 
 // DBIPCityRecord represents a record from DB-IP City database
 type DBIPCityRecord struct {
-	City        string  `maxminddb:"city"`
-	CountryCode string  `maxminddb:"country_code"`
-	Latitude    float32 `maxminddb:"latitude"`
-	Longitude   float32 `maxminddb:"longitude"`
-	Postcode    string  `maxminddb:"postcode"`
-	State1      string  `maxminddb:"state1"` // Primary subdivision (e.g., state/province)
-	State2      string  `maxminddb:"state2"` // Secondary subdivision
-	Timezone    string  `maxminddb:"timezone"`
+	City        string   `maxminddb:"city"`
+	CountryCode string   `maxminddb:"country_code"`
+	Latitude    *float32 `maxminddb:"latitude"`
+	Longitude   *float32 `maxminddb:"longitude"`
+	Postcode    string   `maxminddb:"postcode"`
+	State1      string   `maxminddb:"state1"` // Primary subdivision (e.g., state/province)
+	State2      string   `maxminddb:"state2"` // Secondary subdivision
+	Timezone    string   `maxminddb:"timezone"`
 }
 
 // DBIPCityReader reads the DB-IP City databases (both IPv4 and IPv6)
@@ -113,18 +113,30 @@ func (r *DBIPCityRecord) HasGeoData() bool {
 	return r.CountryCode != "" || r.City != ""
 }
 
-// HasLocationData checks if the record has coordinate data.
-// Note: (0,0) is a valid coordinate but extremely rare in real IP data.
+// HasLocationData checks if the record has any location data.
 func (r *DBIPCityRecord) HasLocationData() bool {
-	return r.Latitude != 0 || r.Longitude != 0 || r.Timezone != ""
+	return r.HasCoordinates() || r.Timezone != ""
+}
+
+// HasCoordinates checks whether latitude and longitude were present in the DB.
+func (r *DBIPCityRecord) HasCoordinates() bool {
+	return r.Latitude != nil && r.Longitude != nil
+}
+
+// Coordinates returns latitude, longitude, and whether both were present.
+func (r *DBIPCityRecord) Coordinates() (float64, float64, bool) {
+	if !r.HasCoordinates() {
+		return 0, 0, false
+	}
+	return float64(*r.Latitude), float64(*r.Longitude), true
 }
 
 // Reset clears all fields for reuse, reducing allocations
 func (r *DBIPCityRecord) Reset() {
 	r.City = ""
 	r.CountryCode = ""
-	r.Latitude = 0
-	r.Longitude = 0
+	r.Latitude = nil
+	r.Longitude = nil
 	r.Postcode = ""
 	r.State1 = ""
 	r.State2 = ""

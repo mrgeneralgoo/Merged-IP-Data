@@ -2,7 +2,6 @@ package merger
 
 import (
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -47,6 +46,7 @@ type workerContext struct {
 	// Per-worker ASN cache
 	cachedASN        ASNRecord
 	cachedASNNetwork *net.IPNet
+	cachedASNSource  asnSource
 	cachedASNValid   bool
 
 	// Per-worker statistics (atomically updated)
@@ -93,14 +93,13 @@ func newWorkerPool(
 	badASN *reader.BadASNReader,
 ) *workerPool {
 	if numWorkers <= 0 {
-		numWorkers = runtime.NumCPU()
+		numWorkers = mergeWorkerCount()
 	}
 
-	// Use buffered channels to reduce blocking
-	// Work channel: large buffer to keep workers busy
-	// Result channel: batch size * 2 to allow some buffering
-	workChanSize := numWorkers * 1000
-	resultChanSize := numWorkers * 100
+	// Keep buffers bounded: work items hold decoded maps and results hold MMDB
+	// maps, so oversized buffers inflate heap use without helping GitHub Actions.
+	workChanSize := numWorkers * 256
+	resultChanSize := numWorkers * 64
 
 	pool := &workerPool{
 		numWorkers: numWorkers,
@@ -219,6 +218,7 @@ func (ctx *workerContext) buildMergedRecord(network *net.IPNet, geoRecord *reade
 
 	if geoRecord.HasGeoData() {
 		ctx.stats.geoLiteCityHits++
+		latitude, longitude, hasCoordinates := geoRecord.Coordinates()
 
 		record.City = CityRecord{
 			GeonameID: geoRecord.City.GeonameID,
@@ -239,11 +239,11 @@ func (ctx *workerContext) buildMergedRecord(network *net.IPNet, geoRecord *reade
 
 		record.Location = LocationRecord{
 			AccuracyRadius: geoRecord.Location.AccuracyRadius,
-			Latitude:       geoRecord.Location.Latitude,
-			Longitude:      geoRecord.Location.Longitude,
+			Latitude:       latitude,
+			Longitude:      longitude,
 			MetroCode:      geoRecord.Location.MetroCode,
 			TimeZone:       geoRecord.Location.TimeZone,
-			HasCoordinates: geoRecord.HasLocationData(),
+			HasCoordinates: hasCoordinates,
 		}
 
 		record.Postal = PostalRecord{
@@ -280,57 +280,76 @@ func (ctx *workerContext) enrichWithASNData(ip net.IP, record *MergedRecord) {
 	if ctx.cachedASNValid && ctx.cachedASNNetwork != nil && ctx.cachedASNNetwork.Contains(ip) {
 		if ctx.cachedASN.Number != 0 {
 			record.ASN = ctx.cachedASN
+			ctx.incrementASNHit(ctx.cachedASNSource)
 		}
 		return
 	}
 
 	ctx.cachedASNValid = false
 	ctx.cachedASNNetwork = nil
+	ctx.cachedASNSource = asnSourceNone
 
 	// Priority 1: IPinfo Lite
 	ctx.reusableIPinfoRecord.Reset()
-	if err := ctx.ipinfoLite.LookupTo(ip, &ctx.reusableIPinfoRecord); err == nil && ctx.reusableIPinfoRecord.HasASN() {
+	if network, ok, err := ctx.ipinfoLite.LookupNetworkTo(ip, &ctx.reusableIPinfoRecord); err == nil && ok && ctx.reusableIPinfoRecord.HasASN() {
 		ctx.stats.ipinfoLiteHits++
 		record.ASN = ASNRecord{
 			Number:       ctx.reusableIPinfoRecord.GetASNumber(),
 			Organization: ctx.reusableIPinfoRecord.ASName,
 			Domain:       ctx.reusableIPinfoRecord.ASDomain,
 		}
-		// Cache (simplified - use lookup result)
 		ctx.cachedASN = record.ASN
+		ctx.cachedASNNetwork = network
+		ctx.cachedASNSource = asnSourceIPinfo
 		ctx.cachedASNValid = true
 		return
 	}
 
 	// Priority 2: GeoLite2-ASN
 	ctx.reusableGeoLiteASNRecord.Reset()
-	if err := ctx.geoLiteASN.LookupTo(ip, &ctx.reusableGeoLiteASNRecord); err == nil && ctx.reusableGeoLiteASNRecord.HasASN() {
+	if network, ok, err := ctx.geoLiteASN.LookupNetworkTo(ip, &ctx.reusableGeoLiteASNRecord); err == nil && ok && ctx.reusableGeoLiteASNRecord.HasASN() {
 		ctx.stats.geoLiteASNHits++
 		record.ASN = ASNRecord{
 			Number:       ctx.reusableGeoLiteASNRecord.AutonomousSystemNumber,
 			Organization: ctx.reusableGeoLiteASNRecord.AutonomousSystemOrganization,
 		}
 		ctx.cachedASN = record.ASN
+		ctx.cachedASNNetwork = network
+		ctx.cachedASNSource = asnSourceGeoLite
 		ctx.cachedASNValid = true
 		return
 	}
 
 	// Priority 3: RouteViews ASN
 	ctx.reusableRouteViewsRecord.Reset()
-	if err := ctx.routeViewsASN.LookupTo(ip, &ctx.reusableRouteViewsRecord); err == nil && ctx.reusableRouteViewsRecord.HasASN() {
+	if network, ok, err := ctx.routeViewsASN.LookupNetworkTo(ip, &ctx.reusableRouteViewsRecord); err == nil && ok && ctx.reusableRouteViewsRecord.HasASN() {
 		ctx.stats.routeViewsASNHits++
 		record.ASN = ASNRecord{
 			Number:       ctx.reusableRouteViewsRecord.AutonomousSystemNumber,
 			Organization: ctx.reusableRouteViewsRecord.AutonomousSystemOrganization,
 		}
 		ctx.cachedASN = record.ASN
+		ctx.cachedASNNetwork = network
+		ctx.cachedASNSource = asnSourceRouteViews
 		ctx.cachedASNValid = true
 		return
 	}
 
 	// No ASN found
 	ctx.cachedASN = ASNRecord{}
+	ctx.cachedASNSource = asnSourceNone
 	ctx.cachedASNValid = true
+}
+
+func (ctx *workerContext) incrementASNHit(source asnSource) {
+	switch source {
+	case asnSourceIPinfo:
+		ctx.stats.ipinfoLiteHits++
+	case asnSourceGeoLite:
+		ctx.stats.geoLiteASNHits++
+	case asnSourceRouteViews:
+		ctx.stats.routeViewsASNHits++
+	}
 }
 
 // enrichWithCountryFallback adds country information from GeoWhois when country is missing
@@ -364,10 +383,7 @@ func (ctx *workerContext) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 	ctx.stats.qqwryHits++
 
 	if ctx.reusableQQWryRecord.HasCityData() {
-		if record.City.Names == nil {
-			record.City.Names = make(map[string]string)
-		}
-		record.City.Names["zh-CN"] = ctx.reusableQQWryRecord.CityName
+		record.City.Names = withName(record.City.Names, "zh-CN", ctx.reusableQQWryRecord.CityName)
 	}
 
 	if ctx.reusableQQWryRecord.HasRegionData() {
@@ -376,18 +392,12 @@ func (ctx *workerContext) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 				Names: map[string]string{"zh-CN": ctx.reusableQQWryRecord.RegionName},
 			}}
 		} else {
-			if record.Subdivisions[0].Names == nil {
-				record.Subdivisions[0].Names = make(map[string]string)
-			}
-			record.Subdivisions[0].Names["zh-CN"] = ctx.reusableQQWryRecord.RegionName
+			record.Subdivisions[0].Names = withName(record.Subdivisions[0].Names, "zh-CN", ctx.reusableQQWryRecord.RegionName)
 		}
 	}
 
-	if record.Country.Names == nil {
-		record.Country.Names = make(map[string]string)
-	}
 	if _, ok := record.Country.Names["zh-CN"]; !ok {
-		record.Country.Names["zh-CN"] = ctx.reusableQQWryRecord.CountryName
+		record.Country.Names = withName(record.Country.Names, "zh-CN", ctx.reusableQQWryRecord.CountryName)
 	}
 }
 

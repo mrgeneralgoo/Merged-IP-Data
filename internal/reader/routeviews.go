@@ -54,6 +54,16 @@ func (r *RouteViewsASNReader) LookupNetwork(ip net.IP) (*net.IPNet, *RouteViewsA
 	return network, &record, true, nil
 }
 
+// LookupNetworkTo looks up an IP into a pre-allocated record and returns the
+// matched network. The caller should reset record before reuse.
+func (r *RouteViewsASNReader) LookupNetworkTo(ip net.IP, record *RouteViewsASNRecord) (*net.IPNet, bool, error) {
+	network, ok, err := r.Reader.LookupNetwork(ip, record)
+	if err != nil {
+		return nil, false, err
+	}
+	return network, ok, nil
+}
+
 // HasASN checks if the record has ASN data
 func (r *RouteViewsASNRecord) HasASN() bool {
 	return r.AutonomousSystemNumber != 0

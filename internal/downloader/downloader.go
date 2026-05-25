@@ -152,7 +152,7 @@ func (d *Downloader) download(ctx context.Context, source config.DatabaseSource)
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 
-	_, err = io.Copy(file, resp.Body)
+	written, err := io.Copy(file, resp.Body)
 	if closeErr := file.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
@@ -160,6 +160,10 @@ func (d *Downloader) download(ctx context.Context, source config.DatabaseSource)
 	if err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write file: %w", err)
+	}
+	if written == 0 {
+		os.Remove(tmpPath)
+		return fmt.Errorf("downloaded file is empty")
 	}
 
 	if err := os.Rename(tmpPath, source.Path); err != nil {
@@ -180,15 +184,32 @@ func (d *Downloader) download(ctx context.Context, source config.DatabaseSource)
 func VerifyFiles() error {
 	sources := config.GetAllSources()
 	var missing []string
+	var invalid []string
 
 	for _, source := range sources {
-		if _, err := os.Stat(source.Path); os.IsNotExist(err) {
+		info, err := os.Stat(source.Path)
+		if os.IsNotExist(err) {
 			missing = append(missing, source.Path)
+			continue
+		}
+		if err != nil {
+			invalid = append(invalid, fmt.Sprintf("%s (%v)", source.Path, err))
+			continue
+		}
+		if info.IsDir() {
+			invalid = append(invalid, fmt.Sprintf("%s (is a directory)", source.Path))
+			continue
+		}
+		if info.Size() == 0 {
+			invalid = append(invalid, fmt.Sprintf("%s (empty file)", source.Path))
 		}
 	}
 
 	if len(missing) > 0 {
 		return fmt.Errorf("missing database files: %v", missing)
+	}
+	if len(invalid) > 0 {
+		return fmt.Errorf("invalid database files: %v", invalid)
 	}
 
 	return nil

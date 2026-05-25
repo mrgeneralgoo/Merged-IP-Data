@@ -38,16 +38,20 @@ type cidrEntry struct {
 // Uses optimized data structures for fast lookups:
 // - Hash map for single IP addresses: O(1) lookup
 // - IPSet for fast CIDR containment check: O(log n)
-// - Sorted slice with binary search for CIDR record retrieval: O(log n)
+// - Prefix map for bounded CIDR record retrieval: O(address bit length)
 type OpenproxyDBReader struct {
 	singleIPs map[netip.Addr]OpenproxyDBRecord
 
 	// cidrSet provides fast O(log n) containment check
 	cidrSet *netipx.IPSet
 
-	// cidrRanges stores records sorted by prefix for binary search lookup
-	// after confirming containment via cidrSet
+	// cidrRanges stores all CIDR entries for deterministic stats and IPSet
+	// construction.
 	cidrRanges []cidrEntry
+
+	// cidrRecords maps canonical prefixes to records. It makes record retrieval
+	// bounded by address bit length after cidrSet confirms a positive match.
+	cidrRecords map[netip.Prefix]OpenproxyDBRecord
 
 	// anycastSet holds the union of bgp.tools anycast prefixes (v4 + v6).
 	// Any IP contained in this set gets IsCDN=true OR'd onto its OpenProxyDB
@@ -65,8 +69,9 @@ func OpenOpenproxyDB() (*OpenproxyDBReader, error) {
 	defer file.Close()
 
 	reader := &OpenproxyDBReader{
-		singleIPs:  make(map[netip.Addr]OpenproxyDBRecord),
-		cidrRanges: make([]cidrEntry, 0),
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges:  make([]cidrEntry, 0),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
 	}
 
 	if err := reader.parse(file); err != nil {
@@ -105,7 +110,7 @@ func OpenOpenproxyDB() (*OpenproxyDBReader, error) {
 func (r *OpenproxyDBReader) parse(file *os.File) error {
 	bufferedReader := bufio.NewReaderSize(file, 256*1024)
 	csvReader := csv.NewReader(bufferedReader)
-	csvReader.FieldsPerRecord = 10
+	csvReader.FieldsPerRecord = -1
 	csvReader.ReuseRecord = true
 
 	// Read and validate header
@@ -136,6 +141,12 @@ func (r *OpenproxyDBReader) parse(file *os.File) error {
 	schoolIdx := colIndex["school-block"]
 	torIdx := colIndex["tor"]
 	webhostIdx := colIndex["webhost"]
+	maxRequiredIdx := ipIdx
+	for _, idx := range []int{anonblockIdx, proxyIdx, vpnIdx, cdnIdx, rangeblockIdx, schoolIdx, torIdx, webhostIdx} {
+		if idx > maxRequiredIdx {
+			maxRequiredIdx = idx
+		}
+	}
 
 	lineNum := 1
 	for {
@@ -146,6 +157,12 @@ func (r *OpenproxyDBReader) parse(file *os.File) error {
 		}
 		if err != nil {
 			return fmt.Errorf("failed to read CSV line %d: %w", lineNum, err)
+		}
+		if len(row) == 1 && strings.TrimSpace(row[0]) == "" {
+			continue
+		}
+		if len(row) <= maxRequiredIdx {
+			return fmt.Errorf("CSV line %d has %d columns, need at least %d", lineNum, len(row), maxRequiredIdx+1)
 		}
 
 		ipStr := strings.TrimSpace(row[ipIdx])
@@ -186,16 +203,13 @@ func (r *OpenproxyDBReader) parse(file *os.File) error {
 			if err != nil {
 				continue
 			}
-			r.cidrRanges = append(r.cidrRanges, cidrEntry{
-				prefix: prefix,
-				record: record,
-			})
+			r.addCIDRRange(prefix, record)
 		} else {
 			addr, err := netip.ParseAddr(ipStr)
 			if err != nil {
 				continue
 			}
-			r.singleIPs[addr] = record
+			r.singleIPs[addr.Unmap()] = record
 		}
 	}
 
@@ -206,6 +220,49 @@ func (r *OpenproxyDBReader) parse(file *os.File) error {
 func parseBool(s string) bool {
 	s = strings.TrimSpace(strings.ToLower(s))
 	return s == "true" || s == "1"
+}
+
+func canonicalPrefix(prefix netip.Prefix) netip.Prefix {
+	addr := prefix.Addr()
+	bits := prefix.Bits()
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+		if bits >= 96 {
+			bits -= 96
+		} else {
+			bits = 0
+		}
+	} else {
+		addr = addr.Unmap()
+	}
+	return netip.PrefixFrom(addr, bits).Masked()
+}
+
+func (r *OpenproxyDBReader) addCIDRRange(prefix netip.Prefix, record OpenproxyDBRecord) {
+	prefix = canonicalPrefix(prefix)
+	r.cidrRanges = append(r.cidrRanges, cidrEntry{
+		prefix: prefix,
+		record: record,
+	})
+	if r.cidrRecords == nil {
+		r.cidrRecords = make(map[netip.Prefix]OpenproxyDBRecord)
+	}
+	if existing, ok := r.cidrRecords[prefix]; ok {
+		record = mergeOpenproxyRecords(existing, record)
+	}
+	r.cidrRecords[prefix] = record
+}
+
+func mergeOpenproxyRecords(a, b OpenproxyDBRecord) OpenproxyDBRecord {
+	return OpenproxyDBRecord{
+		IsProxy:     a.IsProxy || b.IsProxy,
+		IsVPN:       a.IsVPN || b.IsVPN,
+		IsTor:       a.IsTor || b.IsTor,
+		IsHosting:   a.IsHosting || b.IsHosting,
+		IsCDN:       a.IsCDN || b.IsCDN,
+		IsSchool:    a.IsSchool || b.IsSchool,
+		IsAnonymous: a.IsAnonymous || b.IsAnonymous || a.IsProxy || b.IsProxy || a.IsVPN || b.IsVPN || a.IsTor || b.IsTor,
+	}
 }
 
 // Close closes the reader (no-op as data is in memory)
@@ -225,6 +282,11 @@ func (r *OpenproxyDBReader) Lookup(ip net.IP) *OpenproxyDBRecord {
 // LookupTo looks up an IP address into a pre-allocated record to reduce allocations.
 // Returns true if a record was found.
 func (r *OpenproxyDBReader) LookupTo(ip net.IP, record *OpenproxyDBRecord) bool {
+	if record == nil {
+		return false
+	}
+	record.Reset()
+
 	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return false
@@ -256,7 +318,9 @@ func (r *OpenproxyDBReader) LookupTo(ip net.IP, record *OpenproxyDBRecord) bool 
 }
 
 // findInCIDR searches for the most specific CIDR match for the given address.
-// Uses binary search for O(log n) lookup performance.
+// Negative lookups use cidrSet's O(log n) containment check. Positive lookups
+// walk prefix lengths from most-specific to least-specific, which caps record
+// retrieval at 33 map probes for IPv4 and 129 for IPv6.
 func (r *OpenproxyDBReader) findInCIDR(addr netip.Addr) (OpenproxyDBRecord, bool) {
 	if len(r.cidrRanges) == 0 {
 		return OpenproxyDBRecord{}, false
@@ -267,82 +331,14 @@ func (r *OpenproxyDBReader) findInCIDR(addr netip.Addr) (OpenproxyDBRecord, bool
 		return OpenproxyDBRecord{}, false
 	}
 
-	// Binary search to find a potential match region
-	// Find the rightmost prefix whose start address <= addr
-	idx := sort.Search(len(r.cidrRanges), func(i int) bool {
-		return r.cidrRanges[i].prefix.Addr().Compare(addr) > 0
-	})
-
-	// Search backwards from idx to find matching prefixes
-	// We need to find the most specific (highest bits) match
-	var bestMatch *cidrEntry
-	bestBits := -1
-
-	// Check entries before idx (they have start addr <= our addr)
-	for i := idx - 1; i >= 0; i-- {
-		entry := &r.cidrRanges[i]
-
-		// If this prefix's end is before our address, earlier entries won't match either
-		// (for same prefix length). But we need to check all potential matches.
-		if entry.prefix.Contains(addr) {
-			if entry.prefix.Bits() > bestBits {
-				bestMatch = entry
-				bestBits = entry.prefix.Bits()
-			}
+	bitLen := addr.BitLen()
+	for bits := bitLen; bits >= 0; bits-- {
+		prefix := netip.PrefixFrom(addr, bits).Masked()
+		if record, ok := r.cidrRecords[prefix]; ok {
+			return record, true
 		}
-
-		// Optimization: if we've moved past addresses that could possibly contain addr,
-		// and we have a match, we can stop. This happens when the entry's masked network
-		// is completely before our address.
-		if bestMatch != nil {
-			// If we found a match and this entry's network end is before addr's network start
-			// at the same prefix length, we can stop searching
-			entryEnd := lastAddrInPrefix(entry.prefix)
-			if entryEnd.Compare(addr) < 0 {
-				break
-			}
-		}
-	}
-
-	if bestMatch != nil {
-		return bestMatch.record, true
 	}
 	return OpenproxyDBRecord{}, false
-}
-
-// lastAddrInPrefix returns the last address in a prefix
-func lastAddrInPrefix(p netip.Prefix) netip.Addr {
-	addr := p.Addr()
-	if addr.Is4() {
-		bits := p.Bits()
-		if bits == 32 {
-			return addr
-		}
-		a4 := addr.As4()
-		hostBits := 32 - bits
-		mask := uint32((1 << hostBits) - 1)
-		val := uint32(a4[0])<<24 | uint32(a4[1])<<16 | uint32(a4[2])<<8 | uint32(a4[3])
-		val |= mask
-		return netip.AddrFrom4([4]byte{byte(val >> 24), byte(val >> 16), byte(val >> 8), byte(val)})
-	}
-	// IPv6
-	bits := p.Bits()
-	if bits == 128 {
-		return addr
-	}
-	a16 := addr.As16()
-	hostBits := 128 - bits
-	// Set all host bits to 1
-	for i := 15; i >= 0 && hostBits > 0; i-- {
-		if hostBits >= 8 {
-			a16[i] = 0xFF
-			hostBits -= 8
-		} else {
-			a16[i] |= byte((1 << hostBits) - 1)
-			hostBits = 0
-		}
-	}
-	return netip.AddrFrom16(a16)
 }
 
 // HasData checks if the record has any proxy/anonymity flags set
@@ -385,6 +381,7 @@ func (r *OpenproxyDBReader) LoadBadIPList(path string) (int, error) {
 		if err != nil {
 			continue
 		}
+		addr = addr.Unmap()
 
 		if existing, found := r.singleIPs[addr]; found {
 			// Merge: ensure proxy and anonymous flags are set
@@ -653,6 +650,7 @@ func (r *OpenproxyDBReader) parseAnycastFile(path string, builder *netipx.IPSetB
 			if addrErr != nil {
 				continue
 			}
+			addr = addr.Unmap()
 			bits := 32
 			if addr.Is6() {
 				bits = 128
@@ -660,7 +658,7 @@ func (r *OpenproxyDBReader) parseAnycastFile(path string, builder *netipx.IPSetB
 			prefix = netip.PrefixFrom(addr, bits)
 		}
 
-		builder.AddPrefix(prefix)
+		builder.AddPrefix(canonicalPrefix(prefix))
 		count++
 	}
 

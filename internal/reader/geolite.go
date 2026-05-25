@@ -23,11 +23,11 @@ type GeoLite2CityRecord struct {
 		Names     map[string]string `maxminddb:"names"`
 	} `maxminddb:"country"`
 	Location struct {
-		AccuracyRadius uint16  `maxminddb:"accuracy_radius"`
-		Latitude       float64 `maxminddb:"latitude"`
-		Longitude      float64 `maxminddb:"longitude"`
-		MetroCode      uint16  `maxminddb:"metro_code"`
-		TimeZone       string  `maxminddb:"time_zone"`
+		AccuracyRadius uint16   `maxminddb:"accuracy_radius"`
+		Latitude       *float64 `maxminddb:"latitude"`
+		Longitude      *float64 `maxminddb:"longitude"`
+		MetroCode      uint16   `maxminddb:"metro_code"`
+		TimeZone       string   `maxminddb:"time_zone"`
 	} `maxminddb:"location"`
 	Postal struct {
 		Code string `maxminddb:"code"`
@@ -91,11 +91,23 @@ func (r *GeoLite2CityRecord) HasGeoData() bool {
 	return r.Country.ISOCode != "" || r.City.GeonameID != 0
 }
 
-// HasLocationData checks if the record has coordinate data.
-// Note: (0,0) is a valid coordinate but extremely rare in real IP data.
+// HasLocationData checks if the record has any location data.
 func (r *GeoLite2CityRecord) HasLocationData() bool {
-	return r.Location.AccuracyRadius != 0 || r.Location.Latitude != 0 ||
-		r.Location.Longitude != 0 || r.Location.TimeZone != ""
+	return r.Location.AccuracyRadius != 0 || r.HasCoordinates() ||
+		r.Location.MetroCode != 0 || r.Location.TimeZone != ""
+}
+
+// HasCoordinates checks whether latitude and longitude were present in the DB.
+func (r *GeoLite2CityRecord) HasCoordinates() bool {
+	return r.Location.Latitude != nil && r.Location.Longitude != nil
+}
+
+// Coordinates returns latitude, longitude, and whether both were present.
+func (r *GeoLite2CityRecord) Coordinates() (float64, float64, bool) {
+	if !r.HasCoordinates() {
+		return 0, 0, false
+	}
+	return *r.Location.Latitude, *r.Location.Longitude, true
 }
 
 // Reset clears all fields for reuse, reducing allocations
@@ -109,8 +121,8 @@ func (r *GeoLite2CityRecord) Reset() {
 	r.Country.ISOCode = ""
 	r.Country.Names = nil
 	r.Location.AccuracyRadius = 0
-	r.Location.Latitude = 0
-	r.Location.Longitude = 0
+	r.Location.Latitude = nil
+	r.Location.Longitude = nil
 	r.Location.MetroCode = 0
 	r.Location.TimeZone = ""
 	r.Postal.Code = ""

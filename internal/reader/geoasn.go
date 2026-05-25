@@ -54,6 +54,16 @@ func (r *GeoLite2ASNReader) LookupNetwork(ip net.IP) (*net.IPNet, *GeoLite2ASNRe
 	return network, &record, true, nil
 }
 
+// LookupNetworkTo looks up an IP into a pre-allocated record and returns the
+// matched network. The caller should reset record before reuse.
+func (r *GeoLite2ASNReader) LookupNetworkTo(ip net.IP, record *GeoLite2ASNRecord) (*net.IPNet, bool, error) {
+	network, ok, err := r.Reader.LookupNetwork(ip, record)
+	if err != nil {
+		return nil, false, err
+	}
+	return network, ok, nil
+}
+
 // HasASN checks if the record has ASN data
 func (r *GeoLite2ASNRecord) HasASN() bool {
 	return r.AutonomousSystemNumber != 0

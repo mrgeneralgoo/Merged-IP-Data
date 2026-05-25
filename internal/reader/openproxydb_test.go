@@ -1,0 +1,117 @@
+package reader
+
+import (
+	"net"
+	"net/netip"
+	"os"
+	"testing"
+)
+
+func TestOpenproxyDBParseCanonicalizesCIDRPrefixes(t *testing.T) {
+	path := writeTempFile(t, "proxy-*.csv", "ip,anonblock,proxy,vpn,cdn,rangeblock,school-block,tor,webhost,extra\n10.0.0.1/24,false,false,false,false,true,false,false,true,ignored\n")
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	r := &OpenproxyDBReader{
+		singleIPs:  make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges: make([]cidrEntry, 0),
+	}
+	if err := r.parse(file); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := r.cidrRanges[0].prefix, netip.MustParsePrefix("10.0.0.0/24"); got != want {
+		t.Fatalf("prefix = %s, want %s", got, want)
+	}
+
+	var record OpenproxyDBRecord
+	if !r.LookupTo(net.ParseIP("10.0.0.42"), &record) {
+		t.Fatal("expected CIDR lookup to match canonicalized /24")
+	}
+	if !record.IsProxy || !record.IsHosting {
+		t.Fatalf("record = %+v, want proxy and hosting flags", record)
+	}
+
+	record = OpenproxyDBRecord{IsTor: true, IsAnonymous: true}
+	if r.LookupTo(net.ParseIP("198.51.100.1"), &record) {
+		t.Fatal("unexpected lookup match")
+	}
+	if record.HasData() || record.IsAnonymous {
+		t.Fatalf("record = %+v, want stale flags cleared on miss", record)
+	}
+}
+
+func TestOpenproxyDBCIDRLookupUsesMostSpecificMatch(t *testing.T) {
+	r := &OpenproxyDBReader{
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+	r.addCIDRRange(netip.MustParsePrefix("10.0.0.0/8"), OpenproxyDBRecord{IsHosting: true})
+	r.addCIDRRange(netip.MustParsePrefix("10.1.2.0/24"), OpenproxyDBRecord{IsVPN: true, IsAnonymous: true})
+
+	record, ok := r.findInCIDR(netip.MustParseAddr("10.1.2.3"))
+	if !ok {
+		t.Fatal("expected CIDR match")
+	}
+	if !record.IsVPN || record.IsHosting {
+		t.Fatalf("record = %+v, want most-specific VPN record only", record)
+	}
+}
+
+func TestOpenproxyDBDuplicateCIDRRecordsAreUnioned(t *testing.T) {
+	r := &OpenproxyDBReader{
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+	r.addCIDRRange(netip.MustParsePrefix("203.0.113.0/24"), OpenproxyDBRecord{IsHosting: true})
+	r.addCIDRRange(netip.MustParsePrefix("203.0.113.0/24"), OpenproxyDBRecord{IsTor: true, IsAnonymous: true})
+
+	record, ok := r.findInCIDR(netip.MustParseAddr("203.0.113.8"))
+	if !ok {
+		t.Fatal("expected CIDR match")
+	}
+	if !record.IsHosting || !record.IsTor || !record.IsAnonymous {
+		t.Fatalf("record = %+v, want unioned hosting and tor flags", record)
+	}
+}
+
+func TestLoadBadIPListUnmapsIPv4AndInheritsCIDRFlags(t *testing.T) {
+	path := writeTempFile(t, "badip-*.txt", "::ffff:192.0.2.1\n")
+	r := &OpenproxyDBReader{
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+	r.addCIDRRange(netip.MustParsePrefix("192.0.2.0/24"), OpenproxyDBRecord{IsHosting: true})
+
+	count, err := r.LoadBadIPList(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+
+	var record OpenproxyDBRecord
+	if !r.LookupTo(net.ParseIP("192.0.2.1"), &record) {
+		t.Fatal("expected IPv4 lookup to match IPv4-mapped bad IP")
+	}
+	if !record.IsProxy || !record.IsAnonymous || !record.IsHosting {
+		t.Fatalf("record = %+v, want proxy, anonymous, and inherited hosting flags", record)
+	}
+}
+
+func writeTempFile(t *testing.T, pattern, content string) string {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return file.Name()
+}

@@ -16,6 +16,8 @@ import (
 	"github.com/maxmind/mmdbwriter/mmdbtype"
 )
 
+const maxMergeWorkers = 8
+
 // logMemStats logs current memory statistics for profiling
 func logMemStats(phase string) {
 	var m runtime.MemStats
@@ -26,6 +28,17 @@ func logMemStats(phase string) {
 		m.TotalAlloc/1024/1024,
 		m.Sys/1024/1024,
 		m.NumGC)
+}
+
+func mergeWorkerCount() int {
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers < 1 {
+		return 1
+	}
+	if numWorkers > maxMergeWorkers {
+		return maxMergeWorkers
+	}
+	return numWorkers
 }
 
 // closerList holds a list of io.Closers for cleanup
@@ -72,6 +85,7 @@ type Merger struct {
 	// ASN lookup cache to avoid redundant lookups for adjacent networks
 	cachedASN        ASNRecord
 	cachedASNNetwork *net.IPNet
+	cachedASNSource  asnSource
 	cachedASNValid   bool
 }
 
@@ -91,6 +105,15 @@ type Stats struct {
 	ProcessedNetworks      int64
 	SingleProxyIPsInserted int64
 }
+
+type asnSource uint8
+
+const (
+	asnSourceNone asnSource = iota
+	asnSourceIPinfo
+	asnSourceGeoLite
+	asnSourceRouteViews
+)
 
 // New creates a new Merger instance
 func New() (*Merger, error) {
@@ -282,7 +305,7 @@ func (m *Merger) Merge() error {
 	startTime := time.Now()
 	logMemStats("Start")
 
-	numWorkers := runtime.NumCPU()
+	numWorkers := mergeWorkerCount()
 	fmt.Printf("Processing GeoLite2-City networks (primary source) with %d workers...\n", numWorkers)
 	if err := m.processGeoLiteCityNetworksParallel(numWorkers); err != nil {
 		return fmt.Errorf("failed to process GeoLite2-City: %w", err)
@@ -389,6 +412,12 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 		defer close(insertDone)
 		for result := range pool.results() {
 			if err := m.tree.Insert(result.network, result.mmdbRecord); err != nil {
+				if isSkippableInsertError(err) {
+					continue
+				}
+				if insertErr == nil {
+					insertErr = fmt.Errorf("failed to insert network %s: %w", result.network, err)
+				}
 				fmt.Printf("Warning: failed to insert network %s: %v\n", result.network, err)
 				continue
 			}
@@ -497,9 +526,7 @@ func (m *Merger) processDBIPReader(r *reader.Reader) error {
 		if err := m.insertWithMerge(network, &record); err != nil {
 			// Silently skip reserved and aliased networks - these are expected
 			// when DB-IP data contains IANA special-purpose address ranges
-			var aliasedErr *mmdbwriter.AliasedNetworkError
-			var reservedErr *mmdbwriter.ReservedNetworkError
-			if errors.As(err, &aliasedErr) || errors.As(err, &reservedErr) {
+			if isSkippableInsertError(err) {
 				continue
 			}
 			fmt.Printf("Warning: failed to insert DB-IP network %s: %v\n", network, err)
@@ -518,6 +545,7 @@ func (m *Merger) processDBIPReader(r *reader.Reader) error {
 func (m *Merger) buildMergedRecord(network *net.IPNet, geoRecord *reader.GeoLite2CityRecord, record *MergedRecord) {
 	if geoRecord.HasGeoData() {
 		m.stats.GeoLiteCityHits++
+		latitude, longitude, hasCoordinates := geoRecord.Coordinates()
 
 		// Source maps from maxminddb are read-only, safe to reference directly
 		record.City = CityRecord{
@@ -539,11 +567,11 @@ func (m *Merger) buildMergedRecord(network *net.IPNet, geoRecord *reader.GeoLite
 
 		record.Location = LocationRecord{
 			AccuracyRadius: geoRecord.Location.AccuracyRadius,
-			Latitude:       geoRecord.Location.Latitude,
-			Longitude:      geoRecord.Location.Longitude,
+			Latitude:       latitude,
+			Longitude:      longitude,
 			MetroCode:      geoRecord.Location.MetroCode,
 			TimeZone:       geoRecord.Location.TimeZone,
-			HasCoordinates: geoRecord.HasLocationData(),
+			HasCoordinates: hasCoordinates,
 		}
 
 		record.Postal = PostalRecord{
@@ -587,11 +615,12 @@ func (m *Merger) buildMergedRecordFromDBIP(network *net.IPNet, dbipRecord *reade
 		}
 
 		if dbipRecord.HasLocationData() {
+			latitude, longitude, hasCoordinates := dbipRecord.Coordinates()
 			record.Location = LocationRecord{
-				Latitude:       float64(dbipRecord.Latitude),
-				Longitude:      float64(dbipRecord.Longitude),
+				Latitude:       latitude,
+				Longitude:      longitude,
 				TimeZone:       dbipRecord.Timezone,
-				HasCoordinates: true,
+				HasCoordinates: hasCoordinates,
 			}
 		}
 
@@ -651,10 +680,7 @@ func (m *Merger) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 
 	// Enrich city names with Chinese (zh-CN)
 	if m.reusableQQWryRecord.HasCityData() {
-		if record.City.Names == nil {
-			record.City.Names = make(map[string]string)
-		}
-		record.City.Names["zh-CN"] = m.reusableQQWryRecord.CityName
+		record.City.Names = withName(record.City.Names, "zh-CN", m.reusableQQWryRecord.CityName)
 	}
 
 	// Enrich subdivision (province) names with Chinese (zh-CN)
@@ -664,19 +690,13 @@ func (m *Merger) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 				Names: map[string]string{"zh-CN": m.reusableQQWryRecord.RegionName},
 			}}
 		} else {
-			if record.Subdivisions[0].Names == nil {
-				record.Subdivisions[0].Names = make(map[string]string)
-			}
-			record.Subdivisions[0].Names["zh-CN"] = m.reusableQQWryRecord.RegionName
+			record.Subdivisions[0].Names = withName(record.Subdivisions[0].Names, "zh-CN", m.reusableQQWryRecord.RegionName)
 		}
 	}
 
 	// Add Chinese country name if not present
-	if record.Country.Names == nil {
-		record.Country.Names = make(map[string]string)
-	}
 	if _, ok := record.Country.Names["zh-CN"]; !ok {
-		record.Country.Names["zh-CN"] = m.reusableQQWryRecord.CountryName
+		record.Country.Names = withName(record.Country.Names, "zh-CN", m.reusableQQWryRecord.CountryName)
 	}
 }
 
@@ -687,6 +707,7 @@ func (m *Merger) enrichWithASNData(ip net.IP, record *MergedRecord) {
 	if m.cachedASNValid && m.cachedASNNetwork != nil && m.cachedASNNetwork.Contains(ip) {
 		if m.cachedASN.Number != 0 {
 			record.ASN = m.cachedASN
+			m.incrementASNHit(m.cachedASNSource)
 		}
 		return
 	}
@@ -694,63 +715,69 @@ func (m *Merger) enrichWithASNData(ip net.IP, record *MergedRecord) {
 	// Cache miss - perform lookups
 	m.cachedASNValid = false
 	m.cachedASNNetwork = nil
+	m.cachedASNSource = asnSourceNone
 
 	// Priority 1: IPinfo Lite (includes as_domain)
 	m.reusableIPinfoRecord.Reset()
-	if network, _, lookupOK, err := m.ipinfoLite.LookupNetwork(ip); err == nil && lookupOK && m.reusableIPinfoRecord.HasASN() {
-		// Need to do a separate lookup to get the record data since LookupNetwork returns record
-		if err := m.ipinfoLite.LookupTo(ip, &m.reusableIPinfoRecord); err == nil && m.reusableIPinfoRecord.HasASN() {
-			m.stats.IPinfoLiteHits++
-			record.ASN = ASNRecord{
-				Number:       m.reusableIPinfoRecord.GetASNumber(),
-				Organization: m.reusableIPinfoRecord.ASName,
-				Domain:       m.reusableIPinfoRecord.ASDomain,
-			}
-			// Cache the result
-			m.cachedASN = record.ASN
-			m.cachedASNNetwork = network
-			m.cachedASNValid = true
-			return
+	if network, lookupOK, err := m.ipinfoLite.LookupNetworkTo(ip, &m.reusableIPinfoRecord); err == nil && lookupOK && m.reusableIPinfoRecord.HasASN() {
+		m.stats.IPinfoLiteHits++
+		record.ASN = ASNRecord{
+			Number:       m.reusableIPinfoRecord.GetASNumber(),
+			Organization: m.reusableIPinfoRecord.ASName,
+			Domain:       m.reusableIPinfoRecord.ASDomain,
 		}
+		m.cachedASN = record.ASN
+		m.cachedASNNetwork = network
+		m.cachedASNSource = asnSourceIPinfo
+		m.cachedASNValid = true
+		return
 	}
 
 	// Priority 2: GeoLite2-ASN
 	m.reusableGeoLiteASNRecord.Reset()
-	if network, _, lookupOK, err := m.geoLiteASN.LookupNetwork(ip); err == nil && lookupOK {
-		if err := m.geoLiteASN.LookupTo(ip, &m.reusableGeoLiteASNRecord); err == nil && m.reusableGeoLiteASNRecord.HasASN() {
-			m.stats.GeoLiteASNHits++
-			record.ASN = ASNRecord{
-				Number:       m.reusableGeoLiteASNRecord.AutonomousSystemNumber,
-				Organization: m.reusableGeoLiteASNRecord.AutonomousSystemOrganization,
-			}
-			// Cache the result
-			m.cachedASN = record.ASN
-			m.cachedASNNetwork = network
-			m.cachedASNValid = true
-			return
+	if network, lookupOK, err := m.geoLiteASN.LookupNetworkTo(ip, &m.reusableGeoLiteASNRecord); err == nil && lookupOK && m.reusableGeoLiteASNRecord.HasASN() {
+		m.stats.GeoLiteASNHits++
+		record.ASN = ASNRecord{
+			Number:       m.reusableGeoLiteASNRecord.AutonomousSystemNumber,
+			Organization: m.reusableGeoLiteASNRecord.AutonomousSystemOrganization,
 		}
+		m.cachedASN = record.ASN
+		m.cachedASNNetwork = network
+		m.cachedASNSource = asnSourceGeoLite
+		m.cachedASNValid = true
+		return
 	}
 
 	// Priority 3: RouteViews ASN
 	m.reusableRouteViewsRecord.Reset()
-	if network, _, lookupOK, err := m.routeViewsASN.LookupNetwork(ip); err == nil && lookupOK {
-		if err := m.routeViewsASN.LookupTo(ip, &m.reusableRouteViewsRecord); err == nil && m.reusableRouteViewsRecord.HasASN() {
-			m.stats.RouteViewsASNHits++
-			record.ASN = ASNRecord{
-				Number:       m.reusableRouteViewsRecord.AutonomousSystemNumber,
-				Organization: m.reusableRouteViewsRecord.AutonomousSystemOrganization,
-			}
-			// Cache the result
-			m.cachedASN = record.ASN
-			m.cachedASNNetwork = network
-			m.cachedASNValid = true
-			return
+	if network, lookupOK, err := m.routeViewsASN.LookupNetworkTo(ip, &m.reusableRouteViewsRecord); err == nil && lookupOK && m.reusableRouteViewsRecord.HasASN() {
+		m.stats.RouteViewsASNHits++
+		record.ASN = ASNRecord{
+			Number:       m.reusableRouteViewsRecord.AutonomousSystemNumber,
+			Organization: m.reusableRouteViewsRecord.AutonomousSystemOrganization,
 		}
+		m.cachedASN = record.ASN
+		m.cachedASNNetwork = network
+		m.cachedASNSource = asnSourceRouteViews
+		m.cachedASNValid = true
+		return
 	}
 
 	// No ASN found - cache the miss with empty record
 	m.cachedASN = ASNRecord{}
+	m.cachedASNSource = asnSourceNone
 	m.cachedASNValid = true
+}
+
+func (m *Merger) incrementASNHit(source asnSource) {
+	switch source {
+	case asnSourceIPinfo:
+		m.stats.IPinfoLiteHits++
+	case asnSourceGeoLite:
+		m.stats.GeoLiteASNHits++
+	case asnSourceRouteViews:
+		m.stats.RouteViewsASNHits++
+	}
 }
 
 // enrichWithProxyData adds proxy/anonymity information from OpenProxyDB, and
@@ -845,9 +872,7 @@ func (m *Merger) processSingleProxyIPs() error {
 
 		if err != nil {
 			// Silently skip reserved and aliased networks — consistent with DB-IP phase
-			var aliasedErr *mmdbwriter.AliasedNetworkError
-			var reservedErr *mmdbwriter.ReservedNetworkError
-			if errors.As(err, &aliasedErr) || errors.As(err, &reservedErr) {
+			if isSkippableInsertError(err) {
 				skipped++
 				continue
 			}
@@ -861,6 +886,12 @@ func (m *Merger) processSingleProxyIPs() error {
 	fmt.Printf("Single proxy IPs: %d inserted, %d skipped (of %d total)\n", inserted, skipped, len(singleIPs))
 	m.stats.SingleProxyIPsInserted = int64(inserted)
 	return nil
+}
+
+func isSkippableInsertError(err error) bool {
+	var aliasedErr *mmdbwriter.AliasedNetworkError
+	var reservedErr *mmdbwriter.ReservedNetworkError
+	return errors.As(err, &aliasedErr) || errors.As(err, &reservedErr)
 }
 
 // insertWithMerge inserts a record, merging with existing data if present
