@@ -101,6 +101,40 @@ func TestLoadBadIPListUnmapsIPv4AndInheritsCIDRFlags(t *testing.T) {
 	}
 }
 
+func TestLoadICloudPrivateRelayRangesMarksProxyAndVPN(t *testing.T) {
+	path := writeTempFile(t, "icloud-*.csv", "192.0.2.0/24,US,US-CA,Cupertino,\n2001:db8:abcd::/48,US,US-CA,Cupertino,\n")
+	r := &OpenproxyDBReader{
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges:  make([]cidrEntry, 0),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+	r.addCIDRRange(netip.MustParsePrefix("198.51.100.0/24"), OpenproxyDBRecord{IsHosting: true})
+	if err := r.rebuildCIDRSet(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := r.LoadICloudPrivateRelayRanges(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+	if got := len(r.ICloudPrivateRelayRanges()); got != 2 {
+		t.Fatalf("iCloud range count = %d, want 2", got)
+	}
+
+	for _, ip := range []string{"192.0.2.42", "2001:db8:abcd::1234"} {
+		var record OpenproxyDBRecord
+		if !r.LookupTo(net.ParseIP(ip), &record) {
+			t.Fatalf("expected lookup for %s to match iCloud Private Relay range", ip)
+		}
+		if !record.IsProxy || !record.IsVPN || !record.IsAnonymous {
+			t.Fatalf("record for %s = %+v, want proxy, VPN, and anonymous", ip, record)
+		}
+	}
+}
+
 func writeTempFile(t *testing.T, pattern, content string) string {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), pattern)

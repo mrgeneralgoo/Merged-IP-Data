@@ -2,38 +2,40 @@ package config
 
 // Database download URLs
 const (
-	GeoLite2CityURL    = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb"
-	GeoLite2ASNURL     = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
-	IPinfoLiteURL      = "https://github.com/NetworkCats/IPinfoLite-Download/releases/latest/download/ipinfo_lite.mmdb"
-	DBIPCityIPv4URL    = "https://unpkg.com/@ip-location-db/dbip-city-mmdb/dbip-city-ipv4.mmdb"
-	DBIPCityIPv6URL    = "https://unpkg.com/@ip-location-db/dbip-city-mmdb/dbip-city-ipv6.mmdb"
-	RouteViewsASNURL   = "https://cdn.jsdelivr.net/npm/@ip-location-db/asn-mmdb/asn.mmdb"
-	GeoWhoisCountryURL = "https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-geo-whois-asn-country-mmdb/geolite2-geo-whois-asn-country.mmdb"
-	QQWryURL           = "https://cdn.jsdelivr.net/npm/qqwry.ipdb/qqwry.ipdb"
-	OpenproxyDBURL     = "https://github.com/NetworkCats/OpenProxyDB/releases/latest/download/proxy_blocks.csv"
-	BadIPListURL       = "https://github.com/NetworkCats/badiplist/releases/latest/download/badiplist.txt"
-	TorRelaysURL       = "https://onionoo.torproject.org/details?type=relay&running=true&fields=or_addresses,exit_addresses"
-	AnycastV4URL       = "https://raw.githubusercontent.com/bgptools/anycast-prefixes/refs/heads/master/anycatch-v4-prefixes.txt"
-	AnycastV6URL       = "https://raw.githubusercontent.com/bgptools/anycast-prefixes/refs/heads/master/anycatch-v6-prefixes.txt"
-	BadASNListURL      = "https://raw.githubusercontent.com/brianhama/bad-asn-list/refs/heads/master/bad-asn-list.csv"
+	GeoLite2CityURL       = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb"
+	GeoLite2ASNURL        = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
+	IPinfoLiteURL         = "https://github.com/NetworkCats/IPinfoLite-Download/releases/latest/download/ipinfo_lite.mmdb"
+	DBIPCityIPv4URL       = "https://unpkg.com/@ip-location-db/dbip-city-mmdb/dbip-city-ipv4.mmdb"
+	DBIPCityIPv6URL       = "https://unpkg.com/@ip-location-db/dbip-city-mmdb/dbip-city-ipv6.mmdb"
+	RouteViewsASNURL      = "https://cdn.jsdelivr.net/npm/@ip-location-db/asn-mmdb/asn.mmdb"
+	GeoWhoisCountryURL    = "https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-geo-whois-asn-country-mmdb/geolite2-geo-whois-asn-country.mmdb"
+	QQWryURL              = "https://cdn.jsdelivr.net/npm/qqwry.ipdb/qqwry.ipdb"
+	OpenproxyDBURL        = "https://github.com/NetworkCats/OpenProxyDB/releases/latest/download/proxy_blocks.csv"
+	ICloudPrivateRelayURL = "https://mask-api.icloud.com/egress-ip-ranges.csv"
+	BadIPListURL          = "https://github.com/NetworkCats/badiplist/releases/latest/download/badiplist.txt"
+	TorRelaysURL          = "https://onionoo.torproject.org/details?type=relay&running=true&fields=or_addresses,exit_addresses"
+	AnycastV4URL          = "https://raw.githubusercontent.com/bgptools/anycast-prefixes/refs/heads/master/anycatch-v4-prefixes.txt"
+	AnycastV6URL          = "https://raw.githubusercontent.com/bgptools/anycast-prefixes/refs/heads/master/anycatch-v6-prefixes.txt"
+	BadASNListURL         = "https://raw.githubusercontent.com/brianhama/bad-asn-list/refs/heads/master/bad-asn-list.csv"
 )
 
 // Local file paths for downloaded databases
 const (
-	GeoLite2CityFile    = "download/GeoLite2-City.mmdb"
-	GeoLite2ASNFile     = "download/GeoLite2-ASN.mmdb"
-	IPinfoLiteFile      = "download/ipinfo_lite.mmdb"
-	DBIPCityIPv4File    = "download/dbip-city-ipv4.mmdb"
-	DBIPCityIPv6File    = "download/dbip-city-ipv6.mmdb"
-	RouteViewsASNFile   = "download/routeviews-asn.mmdb"
-	GeoWhoisCountryFile = "download/geolite2-geo-whois-asn-country.mmdb"
-	QQWryFile           = "download/qqwry.ipdb"
-	OpenproxyDBFile     = "download/proxy_blocks.csv"
-	BadIPListFile       = "download/badiplist.txt"
-	TorRelaysFile       = "download/tor_relays.json"
-	AnycastV4File       = "download/anycast-v4.txt"
-	AnycastV6File       = "download/anycast-v6.txt"
-	BadASNListFile      = "download/bad-asn-list.csv"
+	GeoLite2CityFile       = "download/GeoLite2-City.mmdb"
+	GeoLite2ASNFile        = "download/GeoLite2-ASN.mmdb"
+	IPinfoLiteFile         = "download/ipinfo_lite.mmdb"
+	DBIPCityIPv4File       = "download/dbip-city-ipv4.mmdb"
+	DBIPCityIPv6File       = "download/dbip-city-ipv6.mmdb"
+	RouteViewsASNFile      = "download/routeviews-asn.mmdb"
+	GeoWhoisCountryFile    = "download/geolite2-geo-whois-asn-country.mmdb"
+	QQWryFile              = "download/qqwry.ipdb"
+	OpenproxyDBFile        = "download/proxy_blocks.csv"
+	ICloudPrivateRelayFile = "download/icloud-private-relay.csv"
+	BadIPListFile          = "download/badiplist.txt"
+	TorRelaysFile          = "download/tor_relays.json"
+	AnycastV4File          = "download/anycast-v4.txt"
+	AnycastV6File          = "download/anycast-v6.txt"
+	BadASNListFile         = "download/bad-asn-list.csv"
 )
 
 // Output file path
@@ -86,6 +88,7 @@ func GetAllSources() []DatabaseSource {
 		{Name: "GeoWhois-Country", URL: GeoWhoisCountryURL, Path: GeoWhoisCountryFile},
 		{Name: "QQWry-Chunzhen", URL: QQWryURL, Path: QQWryFile},
 		{Name: "OpenProxyDB", URL: OpenproxyDBURL, Path: OpenproxyDBFile},
+		{Name: "iCloud-Private-Relay", URL: ICloudPrivateRelayURL, Path: ICloudPrivateRelayFile},
 		{Name: "BadIPList", URL: BadIPListURL, Path: BadIPListFile},
 		{Name: "Tor-Relays", URL: TorRelaysURL, Path: TorRelaysFile},
 		{Name: "Anycast-V4", URL: AnycastV4URL, Path: AnycastV4File},

@@ -53,6 +53,10 @@ type OpenproxyDBReader struct {
 	// bounded by address bit length after cidrSet confirms a positive match.
 	cidrRecords map[netip.Prefix]OpenproxyDBRecord
 
+	// icloudPrivateRelayRanges stores the source CIDRs from Apple's iCloud
+	// Private Relay egress list so the merger can overlay them exactly.
+	icloudPrivateRelayRanges []netip.Prefix
+
 	// anycastSet holds the union of bgp.tools anycast prefixes (v4 + v6).
 	// Any IP contained in this set gets IsCDN=true OR'd onto its OpenProxyDB
 	// record during lookup so the CDN tag coexists with any existing tags
@@ -78,29 +82,8 @@ func OpenOpenproxyDB() (*OpenproxyDBReader, error) {
 		return nil, fmt.Errorf("failed to parse OpenProxyDB: %w", err)
 	}
 
-	// Sort CIDR ranges by prefix for binary search lookup
-	// Sort by address first, then by prefix length (more specific first)
-	sort.Slice(reader.cidrRanges, func(i, j int) bool {
-		pi, pj := reader.cidrRanges[i].prefix, reader.cidrRanges[j].prefix
-		addrCmp := pi.Addr().Compare(pj.Addr())
-		if addrCmp != 0 {
-			return addrCmp < 0
-		}
-		// More specific (larger prefix length) comes first
-		return pi.Bits() > pj.Bits()
-	})
-
-	// Build IPSet for fast O(log n) containment checks
-	if len(reader.cidrRanges) > 0 {
-		var builder netipx.IPSetBuilder
-		for i := range reader.cidrRanges {
-			builder.AddPrefix(reader.cidrRanges[i].prefix)
-		}
-		ipSet, err := builder.IPSet()
-		if err != nil {
-			return nil, fmt.Errorf("failed to build IPSet: %w", err)
-		}
-		reader.cidrSet = ipSet
+	if err := reader.rebuildCIDRSet(); err != nil {
+		return nil, fmt.Errorf("failed to build IPSet: %w", err)
 	}
 
 	return reader, nil
@@ -251,6 +234,33 @@ func (r *OpenproxyDBReader) addCIDRRange(prefix netip.Prefix, record OpenproxyDB
 		record = mergeOpenproxyRecords(existing, record)
 	}
 	r.cidrRecords[prefix] = record
+}
+
+func (r *OpenproxyDBReader) rebuildCIDRSet() error {
+	if len(r.cidrRanges) == 0 {
+		r.cidrSet = nil
+		return nil
+	}
+
+	sort.Slice(r.cidrRanges, func(i, j int) bool {
+		pi, pj := r.cidrRanges[i].prefix, r.cidrRanges[j].prefix
+		addrCmp := pi.Addr().Compare(pj.Addr())
+		if addrCmp != 0 {
+			return addrCmp < 0
+		}
+		return pi.Bits() > pj.Bits()
+	})
+
+	var builder netipx.IPSetBuilder
+	for i := range r.cidrRanges {
+		builder.AddPrefix(r.cidrRanges[i].prefix)
+	}
+	ipSet, err := builder.IPSet()
+	if err != nil {
+		return err
+	}
+	r.cidrSet = ipSet
+	return nil
 }
 
 func mergeOpenproxyRecords(a, b OpenproxyDBRecord) OpenproxyDBRecord {

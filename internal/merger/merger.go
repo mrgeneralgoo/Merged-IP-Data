@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"runtime"
 	"time"
 
@@ -91,19 +92,20 @@ type Merger struct {
 
 // Stats holds merge statistics
 type Stats struct {
-	TotalNetworks          int64
-	GeoLiteCityHits        int64
-	GeoLiteASNHits         int64
-	IPinfoLiteHits         int64
-	DBIPHits               int64
-	RouteViewsASNHits      int64
-	GeoWhoisCountryHits    int64
-	QQWryHits              int64
-	OpenproxyDBHits        int64
-	BadASNHits             int64
-	EmptyRecords           int64
-	ProcessedNetworks      int64
-	SingleProxyIPsInserted int64
+	TotalNetworks                    int64
+	GeoLiteCityHits                  int64
+	GeoLiteASNHits                   int64
+	IPinfoLiteHits                   int64
+	DBIPHits                         int64
+	RouteViewsASNHits                int64
+	GeoWhoisCountryHits              int64
+	QQWryHits                        int64
+	OpenproxyDBHits                  int64
+	BadASNHits                       int64
+	EmptyRecords                     int64
+	ProcessedNetworks                int64
+	SingleProxyIPsInserted           int64
+	ICloudPrivateRelayRangesInserted int64
 }
 
 type asnSource uint8
@@ -203,6 +205,13 @@ func New() (*Merger, error) {
 		return nil, fmt.Errorf("failed to load Tor relays: %w", err)
 	}
 	fmt.Printf("Tor relays loaded: %d unique IPs merged into proxy data\n", torCount)
+
+	icloudCount, err := openproxyDB.LoadICloudPrivateRelayRanges(config.ICloudPrivateRelayFile)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to load iCloud Private Relay ranges: %w", err)
+	}
+	fmt.Printf("iCloud Private Relay ranges loaded: %d CIDRs merged into proxy/VPN data\n", icloudCount)
 
 	anycastCount, err := openproxyDB.LoadAnycastPrefixes(config.AnycastV4File, config.AnycastV6File)
 	if err != nil {
@@ -321,6 +330,12 @@ func (m *Merger) Merge() error {
 		return fmt.Errorf("failed to process DB-IP: %w", err)
 	}
 	logMemStats("After DB-IP")
+
+	fmt.Println("Processing iCloud Private Relay ranges (direct CIDR insertion)...")
+	if err := m.processICloudPrivateRelayRanges(); err != nil {
+		return fmt.Errorf("failed to process iCloud Private Relay ranges: %w", err)
+	}
+	logMemStats("After iCloud Private Relay")
 
 	fmt.Println("Processing single proxy IPs (direct /32 and /128 insertion)...")
 	if err := m.processSingleProxyIPs(); err != nil {
@@ -780,11 +795,10 @@ func (m *Merger) incrementASNHit(source asnSource) {
 	}
 }
 
-// enrichWithProxyData adds proxy/anonymity information from OpenProxyDB, and
-// falls back to the bad ASN list when OpenProxyDB did not already flag the IP
-// as a proxy. Bad-ASN matches overlay IsProxy/IsHosting/IsAnonymous onto any
-// existing proxy record (e.g. a CDN-only entry) without clobbering other
-// flags such as IsCDN or IsTor.
+// enrichWithProxyData adds proxy/anonymity information from OpenProxyDB, with
+// a bad-ASN fallback: if OpenProxyDB did not flag the IP as a proxy but the
+// ASN resolved earlier is in the bad ASN list, overlay IsProxy/IsHosting/
+// IsAnonymous onto whatever proxy record is already present.
 func (m *Merger) enrichWithProxyData(ip net.IP, record *MergedRecord) {
 	m.reusableOpenproxyDBRecord.Reset()
 	if m.openproxyDB.LookupTo(ip, &m.reusableOpenproxyDBRecord) {
@@ -808,6 +822,48 @@ func (m *Merger) enrichWithProxyData(ip net.IP, record *MergedRecord) {
 		record.Proxy.IsHosting = true
 		record.Proxy.IsAnonymous = true
 	}
+}
+
+// processICloudPrivateRelayRanges directly overlays every Apple-published
+// iCloud Private Relay CIDR with proxy and VPN flags.
+func (m *Merger) processICloudPrivateRelayRanges() error {
+	ranges := m.openproxyDB.ICloudPrivateRelayRanges()
+	if len(ranges) == 0 {
+		fmt.Println("iCloud Private Relay ranges: 0 inserted, 0 skipped")
+		return nil
+	}
+
+	proxy := ProxyRecord{
+		IsProxy:     true,
+		IsVPN:       true,
+		IsAnonymous: true,
+	}
+	proxyMMDB := proxy.toMMDBType()
+
+	inserted := 0
+	skipped := 0
+	for _, prefix := range ranges {
+		network := netipPrefixToIPNet(prefix)
+		if network == nil {
+			skipped++
+			continue
+		}
+
+		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			fmt.Printf("Warning: failed to insert iCloud Private Relay range %s: %v\n", prefix, err)
+			skipped++
+			continue
+		}
+		inserted++
+	}
+
+	fmt.Printf("iCloud Private Relay ranges: %d inserted, %d skipped (of %d total)\n", inserted, skipped, len(ranges))
+	m.stats.ICloudPrivateRelayRangesInserted = int64(inserted)
+	return nil
 }
 
 // processSingleProxyIPs directly inserts every single IP from OpenProxyDB and BadIPList
@@ -848,31 +904,7 @@ func (m *Merger) processSingleProxyIPs() error {
 			Mask: net.CIDRMask(ones, ones),
 		}
 
-		// InsertFunc merges with any existing record in the tree.
-		// mmdbwriter shares DataType values across tree leaves for deduplication,
-		// so we must never mutate `existing` — always deep-copy first. We also
-		// union proxy flags with any pre-existing proxy map so e.g. Tor and
-		// Hosting coexist rather than one clobbering the other.
-		err := m.tree.InsertFunc(network, func(existing mmdbtype.DataType) (mmdbtype.DataType, error) {
-			if existing == nil {
-				return mmdbtype.Map{keyProxy: proxyMMDB}, nil
-			}
-
-			existingMap, ok := existing.(mmdbtype.Map)
-			if !ok {
-				return mmdbtype.Map{keyProxy: proxyMMDB}, nil
-			}
-
-			copied := existingMap.Copy().(mmdbtype.Map)
-			if prev, hasPrev := copied[keyProxy].(mmdbtype.Map); hasPrev {
-				copied[keyProxy] = unionProxyMaps(prev, proxyMMDB)
-			} else {
-				copied[keyProxy] = proxyMMDB
-			}
-			return copied, nil
-		})
-
-		if err != nil {
+		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
 			// Silently skip reserved and aliased networks — consistent with DB-IP phase
 			if isSkippableInsertError(err) {
 				skipped++
@@ -888,6 +920,54 @@ func (m *Merger) processSingleProxyIPs() error {
 	fmt.Printf("Single proxy IPs: %d inserted, %d skipped (of %d total)\n", inserted, skipped, len(singleIPs))
 	m.stats.SingleProxyIPsInserted = int64(inserted)
 	return nil
+}
+
+func netipPrefixToIPNet(prefix netip.Prefix) *net.IPNet {
+	if !prefix.IsValid() {
+		return nil
+	}
+
+	prefix = prefix.Masked()
+	addr := prefix.Addr()
+	bits := prefix.Bits()
+	if addr.Is4In6() {
+		if bits >= 96 {
+			bits -= 96
+		} else {
+			bits = 0
+		}
+	}
+	addr = addr.Unmap()
+	bitLen := addr.BitLen()
+	if bits > bitLen {
+		bits = bitLen
+	}
+
+	return &net.IPNet{
+		IP:   addr.AsSlice(),
+		Mask: net.CIDRMask(bits, bitLen),
+	}
+}
+
+func (m *Merger) insertProxyMap(network *net.IPNet, proxyMMDB mmdbtype.Map) error {
+	return m.tree.InsertFunc(network, func(existing mmdbtype.DataType) (mmdbtype.DataType, error) {
+		if existing == nil {
+			return mmdbtype.Map{keyProxy: proxyMMDB}, nil
+		}
+
+		existingMap, ok := existing.(mmdbtype.Map)
+		if !ok {
+			return mmdbtype.Map{keyProxy: proxyMMDB}, nil
+		}
+
+		copied := existingMap.Copy().(mmdbtype.Map)
+		if prev, hasPrev := copied[keyProxy].(mmdbtype.Map); hasPrev {
+			copied[keyProxy] = unionProxyMaps(prev, proxyMMDB)
+		} else {
+			copied[keyProxy] = proxyMMDB
+		}
+		return copied, nil
+	})
 }
 
 func isSkippableInsertError(err error) bool {
@@ -967,6 +1047,7 @@ func (m *Merger) printStats() {
 	fmt.Printf("  QQWry (Chunzhen) China enrichment hits: %d\n", m.stats.QQWryHits)
 	fmt.Printf("  OpenProxyDB proxy enrichment hits: %d\n", m.stats.OpenproxyDBHits)
 	fmt.Printf("  Bad ASN fallback hits: %d\n", m.stats.BadASNHits)
+	fmt.Printf("  iCloud Private Relay ranges inserted: %d\n", m.stats.ICloudPrivateRelayRangesInserted)
 	fmt.Printf("  Single proxy IPs inserted (/32, /128): %d\n", m.stats.SingleProxyIPsInserted)
 	fmt.Printf("  Empty records skipped: %d\n", m.stats.EmptyRecords)
 	fmt.Printf("  Final network count: %d\n", m.stats.ProcessedNetworks)
