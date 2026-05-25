@@ -3,6 +3,8 @@ package merger
 import (
 	"net/netip"
 	"testing"
+
+	"github.com/maxmind/mmdbwriter/mmdbtype"
 )
 
 func TestWithNameClonesInput(t *testing.T) {
@@ -14,6 +16,121 @@ func TestWithNameClonesInput(t *testing.T) {
 	}
 	if updated["en"] != "Beijing" || updated["zh-CN"] != "Beijing CN" {
 		t.Fatalf("updated = %#v, want original and added names", updated)
+	}
+}
+
+func TestWithNameIgnoresEmptyName(t *testing.T) {
+	original := map[string]string{"en": "China"}
+	updated := withName(original, "zh-CN", "")
+
+	if len(updated) != 1 || updated["en"] != "China" {
+		t.Fatalf("updated = %#v, want original names only", updated)
+	}
+}
+
+func TestToMMDBTypeSkipsEmptyNames(t *testing.T) {
+	record := MergedRecord{
+		City: CityRecord{
+			Names: map[string]string{"en": "", "zh-CN": "Beijing"},
+		},
+	}
+
+	mmdbRecord := record.ToMMDBType()
+	city, ok := mmdbRecord[keyCity].(mmdbtype.Map)
+	if !ok {
+		t.Fatalf("city = %#v, want map", mmdbRecord[keyCity])
+	}
+	names, ok := city[keyNames].(mmdbtype.Map)
+	if !ok {
+		t.Fatalf("names = %#v, want map", city[keyNames])
+	}
+	if _, ok := names[mmdbtype.String("en")]; ok {
+		t.Fatalf("names = %#v, want empty English name omitted", names)
+	}
+	if got := names[mmdbtype.String("zh-CN")]; got != mmdbtype.String("Beijing") {
+		t.Fatalf("zh-CN name = %#v, want Beijing", got)
+	}
+}
+
+func TestMergedRecordIsEmptyIncludesNonPrimaryFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		record MergedRecord
+	}{
+		{
+			name: "registered country",
+			record: MergedRecord{
+				RegisteredCountry: CountryRecord{ISOCode: "US"},
+			},
+		},
+		{
+			name: "postal",
+			record: MergedRecord{
+				Postal: PostalRecord{Code: "10001"},
+			},
+		},
+		{
+			name: "subdivision",
+			record: MergedRecord{
+				Subdivisions: []SubdivisionRecord{{ISOCode: "CA"}},
+			},
+		},
+		{
+			name: "proxy",
+			record: MergedRecord{
+				Proxy: ProxyRecord{IsCDN: true},
+			},
+		},
+		{
+			name: "asn organization only",
+			record: MergedRecord{
+				ASN: ASNRecord{Organization: "Example ASN"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.record.IsEmpty() {
+				t.Fatalf("record = %+v, want non-empty", tt.record)
+			}
+		})
+	}
+}
+
+func TestMergeMMDBMapsRecursivelyMergesAndUnionsProxy(t *testing.T) {
+	existing := mmdbtype.Map{
+		keyCountry: mmdbtype.Map{
+			keyISOCode: mmdbtype.String("US"),
+		},
+		keyProxy: mmdbtype.Map{
+			keyIsCDN: mmdbtype.Bool(true),
+		},
+	}
+	newMap := mmdbtype.Map{
+		keyCountry: mmdbtype.Map{
+			keyNames: mmdbtype.Map{
+				mmdbtype.String("en"): mmdbtype.String("United States"),
+			},
+		},
+		keyProxy: mmdbtype.Map{
+			keyIsProxy: mmdbtype.Bool(true),
+		},
+	}
+
+	merged := mergeMMDBMaps(existing, newMap)
+
+	country := merged[keyCountry].(mmdbtype.Map)
+	if country[keyISOCode] != mmdbtype.String("US") {
+		t.Fatalf("country iso = %#v, want US", country[keyISOCode])
+	}
+	if _, ok := country[keyNames].(mmdbtype.Map); !ok {
+		t.Fatalf("country = %#v, want nested names merged", country)
+	}
+
+	proxy := merged[keyProxy].(mmdbtype.Map)
+	if proxy[keyIsCDN] != mmdbtype.Bool(true) || proxy[keyIsProxy] != mmdbtype.Bool(true) {
+		t.Fatalf("proxy = %#v, want union of CDN and proxy flags", proxy)
 	}
 }
 

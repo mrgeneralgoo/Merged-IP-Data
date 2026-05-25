@@ -101,11 +101,13 @@ type Stats struct {
 	GeoWhoisCountryHits              int64
 	QQWryHits                        int64
 	OpenproxyDBHits                  int64
+	OpenproxyDBCIDRRangesInserted    int64
 	BadASNHits                       int64
 	EmptyRecords                     int64
 	ProcessedNetworks                int64
 	SingleProxyIPsInserted           int64
 	ICloudPrivateRelayRangesInserted int64
+	AnycastPrefixesInserted          int64
 }
 
 type asnSource uint8
@@ -331,11 +333,23 @@ func (m *Merger) Merge() error {
 	}
 	logMemStats("After DB-IP")
 
+	fmt.Println("Processing OpenProxyDB CIDR ranges (direct CIDR insertion)...")
+	if err := m.processOpenProxyDBCIDRRanges(); err != nil {
+		return fmt.Errorf("failed to process OpenProxyDB CIDR ranges: %w", err)
+	}
+	logMemStats("After OpenProxyDB CIDR ranges")
+
 	fmt.Println("Processing iCloud Private Relay ranges (direct CIDR insertion)...")
 	if err := m.processICloudPrivateRelayRanges(); err != nil {
 		return fmt.Errorf("failed to process iCloud Private Relay ranges: %w", err)
 	}
 	logMemStats("After iCloud Private Relay")
+
+	fmt.Println("Processing anycast prefixes (direct CDN insertion)...")
+	if err := m.processAnycastPrefixes(); err != nil {
+		return fmt.Errorf("failed to process anycast prefixes: %w", err)
+	}
+	logMemStats("After Anycast Prefixes")
 
 	fmt.Println("Processing single proxy IPs (direct /32 and /128 insertion)...")
 	if err := m.processSingleProxyIPs(); err != nil {
@@ -355,46 +369,6 @@ func (m *Merger) Merge() error {
 	fmt.Printf("[Interner] %s\n", interner.Stats())
 
 	return nil
-}
-
-// processGeoLiteCityNetworks iterates through GeoLite2-City and merges with other sources
-func (m *Merger) processGeoLiteCityNetworks() error {
-	networks := m.geoLiteCity.Networks()
-
-	// Reuse a single record to reduce allocations
-	var record MergedRecord
-
-	for networks.Next() {
-		var geoRecord reader.GeoLite2CityRecord
-		network, err := networks.Network(&geoRecord)
-		if err != nil {
-			fmt.Printf("Warning: failed to read network: %v\n", err)
-			continue
-		}
-
-		m.stats.TotalNetworks++
-
-		record.Reset()
-		m.buildMergedRecord(network, &geoRecord, &record)
-
-		if record.IsEmpty() {
-			m.stats.EmptyRecords++
-			continue
-		}
-
-		if err := m.tree.Insert(network, record.ToMMDBType()); err != nil {
-			fmt.Printf("Warning: failed to insert network %s: %v\n", network, err)
-			continue
-		}
-
-		m.stats.ProcessedNetworks++
-
-		if m.stats.ProcessedNetworks%100000 == 0 {
-			fmt.Printf("  Processed %d networks...\n", m.stats.ProcessedNetworks)
-		}
-	}
-
-	return networks.Err()
 }
 
 // processGeoLiteCityNetworksParallel processes GeoLite2-City networks using parallel workers.
@@ -524,7 +498,7 @@ func (m *Merger) processDBIPReader(r *reader.Reader) error {
 
 		// Use reusable record to check if GeoLite2 has data for this IP
 		m.reusableGeoLiteCityRecord.Reset()
-		if err := m.geoLiteCity.LookupTo(ip, &m.reusableGeoLiteCityRecord); err == nil && m.reusableGeoLiteCityRecord.HasGeoData() {
+		if err := m.geoLiteCity.LookupTo(ip, &m.reusableGeoLiteCityRecord); err == nil && m.reusableGeoLiteCityRecord.HasPrimaryGeoData() {
 			continue
 		}
 
@@ -555,78 +529,20 @@ func (m *Merger) processDBIPReader(r *reader.Reader) error {
 	return networks.Err()
 }
 
-// buildMergedRecord creates a merged record for a network using GeoLite2-City as primary.
-// The record parameter should be pre-reset before calling this function.
-func (m *Merger) buildMergedRecord(network *net.IPNet, geoRecord *reader.GeoLite2CityRecord, record *MergedRecord) {
-	if geoRecord.HasGeoData() {
-		m.stats.GeoLiteCityHits++
-		latitude, longitude, hasCoordinates := geoRecord.Coordinates()
-
-		// Source maps from maxminddb are read-only, safe to reference directly
-		record.City = CityRecord{
-			GeonameID: geoRecord.City.GeonameID,
-			Names:     geoRecord.City.Names,
-		}
-
-		record.Continent = ContinentRecord{
-			Code:      geoRecord.Continent.Code,
-			GeonameID: geoRecord.Continent.GeonameID,
-			Names:     geoRecord.Continent.Names,
-		}
-
-		record.Country = CountryRecord{
-			GeonameID: geoRecord.Country.GeonameID,
-			ISOCode:   geoRecord.Country.ISOCode,
-			Names:     geoRecord.Country.Names,
-		}
-
-		record.Location = LocationRecord{
-			AccuracyRadius: geoRecord.Location.AccuracyRadius,
-			Latitude:       latitude,
-			Longitude:      longitude,
-			MetroCode:      geoRecord.Location.MetroCode,
-			TimeZone:       geoRecord.Location.TimeZone,
-			HasCoordinates: hasCoordinates,
-		}
-
-		record.Postal = PostalRecord{
-			Code: geoRecord.Postal.Code,
-		}
-
-		record.RegisteredCountry = CountryRecord{
-			GeonameID: geoRecord.RegisteredCountry.GeonameID,
-			ISOCode:   geoRecord.RegisteredCountry.ISOCode,
-			Names:     geoRecord.RegisteredCountry.Names,
-		}
-
-		if len(geoRecord.Subdivisions) > 0 {
-			record.Subdivisions = make([]SubdivisionRecord, len(geoRecord.Subdivisions))
-			for i, sub := range geoRecord.Subdivisions {
-				record.Subdivisions[i] = SubdivisionRecord{
-					GeonameID: sub.GeonameID,
-					ISOCode:   sub.ISOCode,
-					Names:     sub.Names,
-				}
-			}
-		}
-	}
-
-	m.enrichWithASNData(network.IP, record)
-	m.enrichWithCountryFallback(network.IP, record)
-	m.enrichWithQQWryData(network.IP, record)
-	m.enrichWithProxyData(network.IP, record)
-}
-
 // buildMergedRecordFromDBIP creates a merged record using DB-IP as primary geo source.
 // The record parameter should be pre-reset before calling this function.
 func (m *Merger) buildMergedRecordFromDBIP(network *net.IPNet, dbipRecord *reader.DBIPCityRecord, record *MergedRecord) {
 	if dbipRecord.HasGeoData() {
-		record.City = CityRecord{
-			Names: map[string]string{"en": dbipRecord.City},
+		if dbipRecord.City != "" {
+			record.City = CityRecord{
+				Names: map[string]string{"en": dbipRecord.City},
+			}
 		}
 
-		record.Country = CountryRecord{
-			ISOCode: dbipRecord.CountryCode,
+		if dbipRecord.CountryCode != "" {
+			record.Country = CountryRecord{
+				ISOCode: dbipRecord.CountryCode,
+			}
 		}
 
 		if dbipRecord.HasLocationData() {
@@ -710,8 +626,10 @@ func (m *Merger) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 	}
 
 	// Add Chinese country name if not present
-	if _, ok := record.Country.Names["zh-CN"]; !ok {
-		record.Country.Names = withName(record.Country.Names, "zh-CN", m.reusableQQWryRecord.CountryName)
+	if m.reusableQQWryRecord.CountryName != "" {
+		if _, ok := record.Country.Names["zh-CN"]; !ok {
+			record.Country.Names = withName(record.Country.Names, "zh-CN", m.reusableQQWryRecord.CountryName)
+		}
 	}
 }
 
@@ -866,6 +784,95 @@ func (m *Merger) processICloudPrivateRelayRanges() error {
 	return nil
 }
 
+// processOpenProxyDBCIDRRanges directly overlays every CIDR range from
+// OpenProxyDB. Lookup-time enrichment only samples a source network's base IP,
+// so direct insertion is required for exact proxy coverage when proxy ranges
+// are narrower than the geo/ASN networks already in the tree.
+func (m *Merger) processOpenProxyDBCIDRRanges() error {
+	ranges := m.openproxyDB.CIDRRanges()
+	if len(ranges) == 0 {
+		fmt.Println("OpenProxyDB CIDR ranges: 0 inserted, 0 skipped")
+		return nil
+	}
+
+	inserted := 0
+	skipped := 0
+	for _, cidrRange := range ranges {
+		proxy := ProxyRecord{
+			IsProxy:     cidrRange.Record.IsProxy,
+			IsVPN:       cidrRange.Record.IsVPN,
+			IsTor:       cidrRange.Record.IsTor,
+			IsHosting:   cidrRange.Record.IsHosting,
+			IsCDN:       cidrRange.Record.IsCDN,
+			IsSchool:    cidrRange.Record.IsSchool,
+			IsAnonymous: cidrRange.Record.IsAnonymous,
+		}
+		proxyMMDB := proxy.toMMDBType()
+		if proxyMMDB == nil {
+			skipped++
+			continue
+		}
+
+		network := netipPrefixToIPNet(cidrRange.Prefix)
+		if network == nil {
+			skipped++
+			continue
+		}
+
+		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			fmt.Printf("Warning: failed to insert OpenProxyDB CIDR range %s: %v\n", cidrRange.Prefix, err)
+			skipped++
+			continue
+		}
+		inserted++
+	}
+
+	fmt.Printf("OpenProxyDB CIDR ranges: %d inserted, %d skipped (of %d total)\n", inserted, skipped, len(ranges))
+	m.stats.OpenproxyDBCIDRRangesInserted = int64(inserted)
+	return nil
+}
+
+// processAnycastPrefixes directly overlays bgp.tools anycast prefixes with
+// the CDN flag. This avoids relying on geo/ASN source network boundaries to
+// happen to align with anycast CIDRs.
+func (m *Merger) processAnycastPrefixes() error {
+	prefixes := m.openproxyDB.AnycastPrefixes()
+	if len(prefixes) == 0 {
+		fmt.Println("Anycast prefixes: 0 inserted, 0 skipped")
+		return nil
+	}
+
+	proxyMMDB := (&ProxyRecord{IsCDN: true}).toMMDBType()
+	inserted := 0
+	skipped := 0
+	for _, prefix := range prefixes {
+		network := netipPrefixToIPNet(prefix)
+		if network == nil {
+			skipped++
+			continue
+		}
+
+		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			fmt.Printf("Warning: failed to insert anycast prefix %s: %v\n", prefix, err)
+			skipped++
+			continue
+		}
+		inserted++
+	}
+
+	fmt.Printf("Anycast prefixes: %d inserted, %d skipped (of %d total)\n", inserted, skipped, len(prefixes))
+	m.stats.AnycastPrefixesInserted = int64(inserted)
+	return nil
+}
+
 // processSingleProxyIPs directly inserts every single IP from OpenProxyDB and BadIPList
 // as /32 (IPv4) or /128 (IPv6) networks into the MMDB tree.
 // This ensures complete proxy coverage for individual IPs that would otherwise be missed
@@ -1002,8 +1009,23 @@ func mergeMMDBMaps(existing, new mmdbtype.Map) mmdbtype.Map {
 	}
 
 	for k, v := range new {
-		if _, exists := result[k]; !exists {
+		existingValue, exists := result[k]
+		if !exists {
 			result[k] = v
+			continue
+		}
+		if k == keyProxy {
+			if existingProxy, ok := existingValue.(mmdbtype.Map); ok {
+				if newProxy, ok := v.(mmdbtype.Map); ok {
+					result[k] = unionProxyMaps(existingProxy, newProxy)
+				}
+			}
+			continue
+		}
+		if existingMap, ok := existingValue.(mmdbtype.Map); ok {
+			if newMap, ok := v.(mmdbtype.Map); ok {
+				result[k] = mergeMMDBMaps(existingMap, newMap)
+			}
 		}
 	}
 
@@ -1046,8 +1068,10 @@ func (m *Merger) printStats() {
 	fmt.Printf("  GeoWhois Country fallback hits: %d\n", m.stats.GeoWhoisCountryHits)
 	fmt.Printf("  QQWry (Chunzhen) China enrichment hits: %d\n", m.stats.QQWryHits)
 	fmt.Printf("  OpenProxyDB proxy enrichment hits: %d\n", m.stats.OpenproxyDBHits)
+	fmt.Printf("  OpenProxyDB CIDR ranges inserted: %d\n", m.stats.OpenproxyDBCIDRRangesInserted)
 	fmt.Printf("  Bad ASN fallback hits: %d\n", m.stats.BadASNHits)
 	fmt.Printf("  iCloud Private Relay ranges inserted: %d\n", m.stats.ICloudPrivateRelayRangesInserted)
+	fmt.Printf("  Anycast prefixes inserted: %d\n", m.stats.AnycastPrefixesInserted)
 	fmt.Printf("  Single proxy IPs inserted (/32, /128): %d\n", m.stats.SingleProxyIPsInserted)
 	fmt.Printf("  Empty records skipped: %d\n", m.stats.EmptyRecords)
 	fmt.Printf("  Final network count: %d\n", m.stats.ProcessedNetworks)

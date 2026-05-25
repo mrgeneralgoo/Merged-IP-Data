@@ -88,7 +88,30 @@ func (r *GeoLite2CityReader) LookupNetwork(ip net.IP) (*net.IPNet, *GeoLite2City
 
 // HasGeoData checks if the record has meaningful geographic data
 func (r *GeoLite2CityRecord) HasGeoData() bool {
-	return r.Country.ISOCode != "" || r.City.GeonameID != 0
+	return r.City.GeonameID != 0 ||
+		hasStringMapData(r.City.Names) ||
+		r.Continent.Code != "" ||
+		r.Continent.GeonameID != 0 ||
+		hasStringMapData(r.Continent.Names) ||
+		r.Country.GeonameID != 0 ||
+		r.Country.ISOCode != "" ||
+		hasStringMapData(r.Country.Names) ||
+		r.HasLocationData() ||
+		r.Postal.Code != "" ||
+		r.RegisteredCountry.GeonameID != 0 ||
+		r.RegisteredCountry.ISOCode != "" ||
+		hasStringMapData(r.RegisteredCountry.Names) ||
+		hasSubdivisionData(r.Subdivisions)
+}
+
+// HasPrimaryGeoData checks if the record has the primary city/country fields
+// used to decide whether a lower-priority geo source should be skipped.
+func (r *GeoLite2CityRecord) HasPrimaryGeoData() bool {
+	return r.City.GeonameID != 0 ||
+		hasStringMapData(r.City.Names) ||
+		r.Country.GeonameID != 0 ||
+		r.Country.ISOCode != "" ||
+		hasStringMapData(r.Country.Names)
 }
 
 // HasLocationData checks if the record has any location data.
@@ -130,4 +153,26 @@ func (r *GeoLite2CityRecord) Reset() {
 	r.RegisteredCountry.ISOCode = ""
 	r.RegisteredCountry.Names = nil
 	r.Subdivisions = nil
+}
+
+func hasStringMapData(names map[string]string) bool {
+	for lang, name := range names {
+		if lang != "" && name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSubdivisionData(subdivisions []struct {
+	GeonameID uint32            `maxminddb:"geoname_id"`
+	ISOCode   string            `maxminddb:"iso_code"`
+	Names     map[string]string `maxminddb:"names"`
+}) bool {
+	for _, sub := range subdivisions {
+		if sub.GeonameID != 0 || sub.ISOCode != "" || hasStringMapData(sub.Names) {
+			return true
+		}
+	}
+	return false
 }

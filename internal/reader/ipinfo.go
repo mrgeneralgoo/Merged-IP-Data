@@ -77,7 +77,7 @@ func (r *IPinfoLiteReader) LookupNetworkTo(ip net.IP, record *IPinfoLiteRecord) 
 
 // HasASN checks if the record has ASN data
 func (r *IPinfoLiteRecord) HasASN() bool {
-	return r.ASN != ""
+	return r.GetASNumber() != 0
 }
 
 // HasGeoData checks if the record has geographic data
@@ -98,7 +98,10 @@ func (r *IPinfoLiteRecord) GetASNumber() uint32 {
 		return 0
 	}
 
-	asnStr := strings.TrimPrefix(r.ASN, "AS")
+	asnStr := strings.TrimSpace(r.ASN)
+	if len(asnStr) >= 2 && strings.EqualFold(asnStr[:2], "AS") {
+		asnStr = asnStr[2:]
+	}
 	asn, err := strconv.ParseUint(asnStr, 10, 32)
 	if err != nil {
 		r.cachedASNumber = 0

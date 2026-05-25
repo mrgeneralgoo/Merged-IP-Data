@@ -11,12 +11,54 @@ func makeMMDBMap(size int) mmdbtype.Map {
 }
 
 func withName(names map[string]string, lang, name string) map[string]string {
+	if lang == "" || name == "" {
+		return names
+	}
 	cloned := make(map[string]string, len(names)+1)
 	for k, v := range names {
 		cloned[k] = v
 	}
 	cloned[lang] = name
 	return cloned
+}
+
+func hasNames(names map[string]string) bool {
+	for lang, name := range names {
+		if lang != "" && name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSubdivisions(subdivisions []SubdivisionRecord) bool {
+	for i := range subdivisions {
+		if subdivisions[i].hasData() {
+			return true
+		}
+	}
+	return false
+}
+
+func namesToMMDBType(source map[string]string) mmdbtype.Map {
+	count := 0
+	for lang, name := range source {
+		if lang != "" && name != "" {
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+
+	names := makeMMDBMap(count)
+	for lang, name := range source {
+		if lang == "" || name == "" {
+			continue
+		}
+		names[mmdbtype.String(interner.Intern(lang))] = mmdbtype.String(interner.Intern(name))
+	}
+	return names
 }
 
 // Pre-defined mmdbtype.String keys to avoid repeated allocations.
@@ -209,11 +251,12 @@ func (r *MergedRecord) ToMMDBType() mmdbtype.Map {
 
 func (c *CityRecord) toMMDBType() mmdbtype.Map {
 	// Count non-empty fields first to avoid over-allocation
+	names := namesToMMDBType(c.Names)
 	count := 0
 	if c.GeonameID != 0 {
 		count++
 	}
-	if len(c.Names) > 0 {
+	if names != nil {
 		count++
 	}
 	if count == 0 {
@@ -226,11 +269,7 @@ func (c *CityRecord) toMMDBType() mmdbtype.Map {
 		result[keyGeonameID] = mmdbtype.Uint32(c.GeonameID)
 	}
 
-	if len(c.Names) > 0 {
-		names := makeMMDBMap(len(c.Names))
-		for lang, name := range c.Names {
-			names[mmdbtype.String(interner.Intern(lang))] = mmdbtype.String(interner.Intern(name))
-		}
+	if names != nil {
 		result[keyNames] = names
 	}
 
@@ -239,6 +278,7 @@ func (c *CityRecord) toMMDBType() mmdbtype.Map {
 
 func (c *ContinentRecord) toMMDBType() mmdbtype.Map {
 	// Count non-empty fields first to avoid over-allocation
+	names := namesToMMDBType(c.Names)
 	count := 0
 	if c.Code != "" {
 		count++
@@ -246,7 +286,7 @@ func (c *ContinentRecord) toMMDBType() mmdbtype.Map {
 	if c.GeonameID != 0 {
 		count++
 	}
-	if len(c.Names) > 0 {
+	if names != nil {
 		count++
 	}
 	if count == 0 {
@@ -263,11 +303,7 @@ func (c *ContinentRecord) toMMDBType() mmdbtype.Map {
 		result[keyGeonameID] = mmdbtype.Uint32(c.GeonameID)
 	}
 
-	if len(c.Names) > 0 {
-		names := makeMMDBMap(len(c.Names))
-		for lang, name := range c.Names {
-			names[mmdbtype.String(interner.Intern(lang))] = mmdbtype.String(interner.Intern(name))
-		}
+	if names != nil {
 		result[keyNames] = names
 	}
 
@@ -276,6 +312,7 @@ func (c *ContinentRecord) toMMDBType() mmdbtype.Map {
 
 func (c *CountryRecord) toMMDBType() mmdbtype.Map {
 	// Count non-empty fields first to avoid over-allocation
+	names := namesToMMDBType(c.Names)
 	count := 0
 	if c.GeonameID != 0 {
 		count++
@@ -283,7 +320,7 @@ func (c *CountryRecord) toMMDBType() mmdbtype.Map {
 	if c.ISOCode != "" {
 		count++
 	}
-	if len(c.Names) > 0 {
+	if names != nil {
 		count++
 	}
 	if count == 0 {
@@ -300,11 +337,7 @@ func (c *CountryRecord) toMMDBType() mmdbtype.Map {
 		result[keyISOCode] = mmdbtype.String(interner.Intern(c.ISOCode))
 	}
 
-	if len(c.Names) > 0 {
-		names := makeMMDBMap(len(c.Names))
-		for lang, name := range c.Names {
-			names[mmdbtype.String(interner.Intern(lang))] = mmdbtype.String(interner.Intern(name))
-		}
+	if names != nil {
 		result[keyNames] = names
 	}
 
@@ -359,12 +392,13 @@ func (p *PostalRecord) toMMDBType() mmdbtype.Map {
 	}
 
 	result := makeMMDBMap(1)
-	result[keyCode] = mmdbtype.String(p.Code)
+	result[keyCode] = mmdbtype.String(interner.Intern(p.Code))
 	return result
 }
 
 func (s *SubdivisionRecord) toMMDBType() mmdbtype.Map {
 	// Count non-empty fields first to avoid over-allocation
+	names := namesToMMDBType(s.Names)
 	count := 0
 	if s.GeonameID != 0 {
 		count++
@@ -372,7 +406,7 @@ func (s *SubdivisionRecord) toMMDBType() mmdbtype.Map {
 	if s.ISOCode != "" {
 		count++
 	}
-	if len(s.Names) > 0 {
+	if names != nil {
 		count++
 	}
 	if count == 0 {
@@ -389,11 +423,7 @@ func (s *SubdivisionRecord) toMMDBType() mmdbtype.Map {
 		result[keyISOCode] = mmdbtype.String(interner.Intern(s.ISOCode))
 	}
 
-	if len(s.Names) > 0 {
-		names := makeMMDBMap(len(s.Names))
-		for lang, name := range s.Names {
-			names[mmdbtype.String(interner.Intern(lang))] = mmdbtype.String(interner.Intern(name))
-		}
+	if names != nil {
 		result[keyNames] = names
 	}
 
@@ -508,11 +538,15 @@ func (p *ProxyRecord) toMMDBType() mmdbtype.Map {
 
 // IsEmpty checks if the record has no meaningful data
 func (r *MergedRecord) IsEmpty() bool {
-	return r.Country.ISOCode == "" &&
-		r.City.GeonameID == 0 &&
-		len(r.City.Names) == 0 &&
-		r.ASN.Number == 0 &&
-		!r.Location.HasCoordinates
+	return !r.City.hasData() &&
+		!r.Continent.hasData() &&
+		!r.Country.hasData() &&
+		!r.Location.hasData() &&
+		!r.Postal.hasData() &&
+		!r.RegisteredCountry.hasData() &&
+		!hasSubdivisions(r.Subdivisions) &&
+		!r.ASN.hasData() &&
+		!r.Proxy.HasData()
 }
 
 // Reset clears all fields for reuse, reducing allocations
@@ -530,15 +564,54 @@ func (r *MergedRecord) Reset() {
 
 // HasGeoData checks if the record has geographic data
 func (r *MergedRecord) HasGeoData() bool {
-	return r.Country.ISOCode != "" || r.City.GeonameID != 0 || len(r.City.Names) > 0
+	return r.City.hasData() ||
+		r.Continent.hasData() ||
+		r.Country.hasData() ||
+		r.Location.hasData() ||
+		r.Postal.hasData() ||
+		r.RegisteredCountry.hasData() ||
+		hasSubdivisions(r.Subdivisions)
 }
 
 // HasASNData checks if the record has ASN data
 func (r *MergedRecord) HasASNData() bool {
-	return r.ASN.Number != 0
+	return r.ASN.hasData()
 }
 
 // HasLocationData checks if the record has coordinate data
 func (r *MergedRecord) HasLocationData() bool {
-	return r.Location.HasCoordinates
+	return r.Location.hasData()
+}
+
+func (c *CityRecord) hasData() bool {
+	return c.GeonameID != 0 || hasNames(c.Names)
+}
+
+func (c *ContinentRecord) hasData() bool {
+	return c.Code != "" || c.GeonameID != 0 || hasNames(c.Names)
+}
+
+func (c *CountryRecord) hasData() bool {
+	return c.GeonameID != 0 || c.ISOCode != "" || hasNames(c.Names)
+}
+
+func (l *LocationRecord) hasData() bool {
+	return l.AccuracyRadius != 0 || l.HasCoordinates || l.MetroCode != 0 || l.TimeZone != ""
+}
+
+func (p *PostalRecord) hasData() bool {
+	return p.Code != ""
+}
+
+func (s *SubdivisionRecord) hasData() bool {
+	return s.GeonameID != 0 || s.ISOCode != "" || hasNames(s.Names)
+}
+
+func (a *ASNRecord) hasData() bool {
+	return a.Number != 0 || a.Organization != "" || a.Domain != ""
+}
+
+// HasData checks if any proxy/anonymity flag is set.
+func (p *ProxyRecord) HasData() bool {
+	return p.IsProxy || p.IsVPN || p.IsTor || p.IsHosting || p.IsCDN || p.IsSchool || p.IsAnonymous
 }

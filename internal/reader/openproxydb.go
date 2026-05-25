@@ -28,10 +28,25 @@ type OpenproxyDBRecord struct {
 	IsAnonymous bool // computed: IsProxy OR IsVPN OR IsTor
 }
 
+type cidrRangeSource uint8
+
+const (
+	cidrRangeSourceOpenproxy cidrRangeSource = iota
+	cidrRangeSourceICloud
+)
+
 // cidrEntry holds a CIDR prefix and its associated proxy record
 type cidrEntry struct {
 	prefix netip.Prefix
 	record OpenproxyDBRecord
+	source cidrRangeSource
+}
+
+// CIDRRange is an exported snapshot of a CIDR overlay range and its proxy
+// flags. It is returned by accessors so callers cannot mutate reader internals.
+type CIDRRange struct {
+	Prefix netip.Prefix
+	Record OpenproxyDBRecord
 }
 
 // OpenproxyDBReader reads and queries the OpenProxyDB CSV database.
@@ -222,10 +237,15 @@ func canonicalPrefix(prefix netip.Prefix) netip.Prefix {
 }
 
 func (r *OpenproxyDBReader) addCIDRRange(prefix netip.Prefix, record OpenproxyDBRecord) {
+	r.addCIDRRangeWithSource(prefix, record, cidrRangeSourceOpenproxy)
+}
+
+func (r *OpenproxyDBReader) addCIDRRangeWithSource(prefix netip.Prefix, record OpenproxyDBRecord, source cidrRangeSource) {
 	prefix = canonicalPrefix(prefix)
 	r.cidrRanges = append(r.cidrRanges, cidrEntry{
 		prefix: prefix,
 		record: record,
+		source: source,
 	})
 	if r.cidrRecords == nil {
 		r.cidrRecords = make(map[netip.Prefix]OpenproxyDBRecord)
@@ -593,6 +613,39 @@ func (r *OpenproxyDBReader) SingleIPs() map[netip.Addr]OpenproxyDBRecord {
 	return r.singleIPs
 }
 
+// CIDRRanges returns the OpenProxyDB CIDR ranges loaded from the source CSV.
+// Ranges from supplementary feeds, such as iCloud Private Relay, are exposed
+// through their dedicated accessors.
+func (r *OpenproxyDBReader) CIDRRanges() []CIDRRange {
+	merged := make(map[netip.Prefix]OpenproxyDBRecord)
+	for _, entry := range r.cidrRanges {
+		if entry.source != cidrRangeSourceOpenproxy {
+			continue
+		}
+		if existing, ok := merged[entry.prefix]; ok {
+			merged[entry.prefix] = mergeOpenproxyRecords(existing, entry.record)
+		} else {
+			merged[entry.prefix] = entry.record
+		}
+	}
+
+	ranges := make([]CIDRRange, 0, len(merged))
+	for prefix, record := range merged {
+		ranges = append(ranges, CIDRRange{
+			Prefix: prefix,
+			Record: record,
+		})
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		addrCmp := ranges[i].Prefix.Addr().Compare(ranges[j].Prefix.Addr())
+		if addrCmp != 0 {
+			return addrCmp < 0
+		}
+		return ranges[i].Prefix.Bits() > ranges[j].Prefix.Bits()
+	})
+	return ranges
+}
+
 // LoadAnycastPrefixes reads one or more plain-text CIDR prefix list files (as
 // published by bgp.tools anycast-prefixes) and builds the anycast lookup set.
 // Blank lines and '#'-prefixed comments are skipped. Bare IP addresses are
@@ -686,6 +739,15 @@ func (r *OpenproxyDBReader) AnycastPrefixCount() int {
 		return 0
 	}
 	return len(r.anycastSet.Prefixes())
+}
+
+// AnycastPrefixes returns a copy of the normalized anycast prefix set.
+func (r *OpenproxyDBReader) AnycastPrefixes() []netip.Prefix {
+	if r.anycastSet == nil {
+		return nil
+	}
+	prefixes := r.anycastSet.Prefixes()
+	return append([]netip.Prefix(nil), prefixes...)
 }
 
 // Stats returns the count of single IPs and CIDR ranges loaded

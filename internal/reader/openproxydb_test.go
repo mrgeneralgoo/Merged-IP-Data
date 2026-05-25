@@ -74,6 +74,14 @@ func TestOpenproxyDBDuplicateCIDRRecordsAreUnioned(t *testing.T) {
 	if !record.IsHosting || !record.IsTor || !record.IsAnonymous {
 		t.Fatalf("record = %+v, want unioned hosting and tor flags", record)
 	}
+
+	ranges := r.CIDRRanges()
+	if len(ranges) != 1 {
+		t.Fatalf("CIDRRanges length = %d, want duplicate prefix coalesced", len(ranges))
+	}
+	if !ranges[0].Record.IsHosting || !ranges[0].Record.IsTor || !ranges[0].Record.IsAnonymous {
+		t.Fatalf("CIDRRanges[0] = %+v, want unioned hosting and tor flags", ranges[0].Record)
+	}
 }
 
 func TestLoadBadIPListUnmapsIPv4AndInheritsCIDRFlags(t *testing.T) {
@@ -132,6 +140,58 @@ func TestLoadICloudPrivateRelayRangesMarksProxyAndVPN(t *testing.T) {
 		if !record.IsProxy || !record.IsVPN || !record.IsAnonymous {
 			t.Fatalf("record for %s = %+v, want proxy, VPN, and anonymous", ip, record)
 		}
+	}
+}
+
+func TestCIDRRangesExcludeSupplementaryICloudRanges(t *testing.T) {
+	path := writeTempFile(t, "icloud-*.csv", "192.0.2.0/24,US,US-CA,Cupertino,\n")
+	r := &OpenproxyDBReader{
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges:  make([]cidrEntry, 0),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+	r.addCIDRRange(netip.MustParsePrefix("198.51.100.0/24"), OpenproxyDBRecord{IsHosting: true})
+
+	if _, err := r.LoadICloudPrivateRelayRanges(path); err != nil {
+		t.Fatal(err)
+	}
+
+	ranges := r.CIDRRanges()
+	if len(ranges) != 1 {
+		t.Fatalf("CIDRRanges length = %d, want only original OpenProxyDB range", len(ranges))
+	}
+	if ranges[0].Prefix != netip.MustParsePrefix("198.51.100.0/24") {
+		t.Fatalf("CIDRRanges[0] = %s, want original range", ranges[0].Prefix)
+	}
+	if got := len(r.ICloudPrivateRelayRanges()); got != 1 {
+		t.Fatalf("iCloud range count = %d, want 1", got)
+	}
+}
+
+func TestLoadAnycastPrefixesExposesNormalizedPrefixes(t *testing.T) {
+	path := writeTempFile(t, "anycast-*.txt", "::ffff:203.0.113.0/120\n2001:db8::/32\n")
+	r := &OpenproxyDBReader{
+		singleIPs: make(map[netip.Addr]OpenproxyDBRecord),
+	}
+
+	count, err := r.LoadAnycastPrefixes(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	prefixes := r.AnycastPrefixes()
+	want := map[netip.Prefix]bool{
+		netip.MustParsePrefix("203.0.113.0/24"): true,
+		netip.MustParsePrefix("2001:db8::/32"):  true,
+	}
+	for _, prefix := range prefixes {
+		delete(want, prefix)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing normalized anycast prefixes: %#v (got %#v)", want, prefixes)
 	}
 }
 

@@ -54,7 +54,7 @@ func (r *OpenproxyDBReader) LoadICloudPrivateRelayRanges(path string) (int, erro
 		}
 
 		prefix = canonicalPrefix(prefix)
-		r.addCIDRRange(prefix, record)
+		r.addCIDRRangeWithSource(prefix, record, cidrRangeSourceICloud)
 		r.icloudPrivateRelayRanges = append(r.icloudPrivateRelayRanges, prefix)
 		count++
 	}

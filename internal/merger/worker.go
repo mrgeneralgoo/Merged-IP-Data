@@ -77,8 +77,6 @@ type workerPool struct {
 
 	// Aggregated statistics
 	totalNetworks atomic.Int64
-	stats         Stats
-	statsMu       sync.Mutex
 }
 
 // newWorkerPool creates a new worker pool with the specified number of workers
@@ -156,9 +154,6 @@ func (p *workerPool) results() <-chan resultItem {
 
 // aggregateStats aggregates all worker statistics into the pool stats
 func (p *workerPool) aggregateStats() Stats {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-
 	var stats Stats
 	stats.TotalNetworks = p.totalNetworks.Load()
 

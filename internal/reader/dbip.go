@@ -110,7 +110,12 @@ func (r *DBIPCityReader) IPv6Reader() *Reader {
 
 // HasGeoData checks if the record has meaningful geographic data
 func (r *DBIPCityRecord) HasGeoData() bool {
-	return r.CountryCode != "" || r.City != ""
+	return r.CountryCode != "" ||
+		r.City != "" ||
+		r.Postcode != "" ||
+		r.State1 != "" ||
+		r.State2 != "" ||
+		r.HasLocationData()
 }
 
 // HasLocationData checks if the record has any location data.

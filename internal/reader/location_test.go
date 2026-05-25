@@ -8,6 +8,12 @@ func TestGeoLiteCoordinatesDistinguishMissingFromZero(t *testing.T) {
 	if !record.HasLocationData() {
 		t.Fatal("timezone should count as location data")
 	}
+	if !record.HasGeoData() {
+		t.Fatal("timezone-only GeoLite record should count as geo data")
+	}
+	if record.HasPrimaryGeoData() {
+		t.Fatal("timezone-only GeoLite record should not count as primary geo data")
+	}
 	if record.HasCoordinates() {
 		t.Fatal("missing coordinates should not be reported as present")
 	}
@@ -26,6 +32,9 @@ func TestDBIPCoordinatesDistinguishMissingFromZero(t *testing.T) {
 	record.Timezone = "Etc/UTC"
 	if !record.HasLocationData() {
 		t.Fatal("timezone should count as location data")
+	}
+	if !record.HasGeoData() {
+		t.Fatal("timezone-only DB-IP record should count as geo data")
 	}
 	if record.HasCoordinates() {
 		t.Fatal("missing coordinates should not be reported as present")
