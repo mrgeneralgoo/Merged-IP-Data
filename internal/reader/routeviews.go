@@ -6,18 +6,18 @@ import (
 	"merged-ip-data/internal/config"
 )
 
-// RouteViewsASNRecord represents a record from RouteViews ASN database
+// RouteViewsASNRecord represents a record from the Origin ASN database.
 type RouteViewsASNRecord struct {
 	AutonomousSystemNumber       uint32 `maxminddb:"autonomous_system_number"`
 	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"`
 }
 
-// RouteViewsASNReader reads the RouteViews ASN database
+// RouteViewsASNReader reads the Origin ASN database.
 type RouteViewsASNReader struct {
 	*Reader
 }
 
-// OpenRouteViewsASN opens the RouteViews ASN database
+// OpenRouteViewsASN opens the Origin ASN database.
 func OpenRouteViewsASN() (*RouteViewsASNReader, error) {
 	r, err := Open(config.RouteViewsASNFile)
 	if err != nil {
@@ -26,7 +26,7 @@ func OpenRouteViewsASN() (*RouteViewsASNReader, error) {
 	return &RouteViewsASNReader{Reader: r}, nil
 }
 
-// Lookup looks up an IP address in the RouteViews ASN database
+// Lookup looks up an IP address in the Origin ASN database.
 func (r *RouteViewsASNReader) Lookup(ip net.IP) (*RouteViewsASNRecord, error) {
 	var record RouteViewsASNRecord
 	err := r.Reader.Lookup(ip, &record)

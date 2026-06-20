@@ -9,9 +9,9 @@ A Go program that merges multiple IP geolocation databases into a single, compre
 | [GeoLite2-City](https://github.com/P3TERX/GeoLite.mmdb) | Country, city, coordinates, timezone, subdivisions, multi-language names | IPv4 + IPv6 |
 | [GeoLite2-ASN](https://github.com/P3TERX/GeoLite.mmdb) | ASN fallback (secondary) | IPv4 + IPv6 |
 | [IPinfo Lite](https://github.com/NetworkCats/IPinfoLite-Download) | ASN, AS organization, AS domain (primary) | IPv4 + IPv6 |
-| [DB-IP City](https://db-ip.com/) | Supplementary geo data | IPv4 + IPv6 |
-| [RouteViews ASN](https://www.npmjs.com/package/@ip-location-db/asn-mmdb) | ASN fallback (tertiary) | IPv4 + IPv6 |
-| [GeoLite2-Geo-Whois-ASN-Country](https://www.npmjs.com/package/@ip-location-db/geolite2-geo-whois-asn-country-mmdb) | Country fallback | IPv4 + IPv6 |
+| [DB-IP City](https://github.com/sapics/ip-location-db#city) | Supplementary geo data | IPv4 + IPv6 |
+| [Origin ASN](https://github.com/sapics/ip-location-db#asn) | ASN fallback (tertiary) | IPv4 + IPv6 |
+| [GeoLite2 Country](https://github.com/sapics/ip-location-db#country) | Country fallback | IPv4 + IPv6 |
 | [QQWry (Chunzhen)](https://github.com/metowolf/qqwry.ipdb) | Enhanced Chinese IP geolocation with native zh-CN names | IPv4 |
 | [OpenProxyDB](https://github.com/NetworkCats/OpenProxyDB) | Proxy, VPN, Tor, hosting, and CDN detection | IPv4 + IPv6 |
 | [iCloud Private Relay](https://mask-api.icloud.com/egress-ip-ranges.csv) | Proxy and VPN overlay for Apple iCloud Private Relay egress ranges | IPv4 + IPv6 |
@@ -125,7 +125,7 @@ This project merges data from multiple sources. Please refer to each source's li
 - GeoLite2: [Creative Commons Attribution-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-sa/4.0/)
 - IPinfo Lite: [Creative Commons Attribution-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-sa/4.0/)
 - DB-IP: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
-- RouteViews ASN: [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
+- Origin ASN: [CDLA Permissive 2.0](https://cdla.dev/permissive-2-0/)
 - OpenProxyDB: [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
 
 The merge tool source code is provided as-is for educational and personal use.

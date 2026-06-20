@@ -315,7 +315,7 @@ func (ctx *workerContext) enrichWithASNData(ip net.IP, record *MergedRecord) {
 		return
 	}
 
-	// Priority 3: RouteViews ASN
+	// Priority 3: Origin ASN
 	ctx.reusableRouteViewsRecord.Reset()
 	if network, ok, err := ctx.routeViewsASN.LookupNetworkTo(ip, &ctx.reusableRouteViewsRecord); err == nil && ok && ctx.reusableRouteViewsRecord.HasASN() {
 		ctx.stats.routeViewsASNHits++
@@ -347,7 +347,7 @@ func (ctx *workerContext) incrementASNHit(source asnSource) {
 	}
 }
 
-// enrichWithCountryFallback adds country information from GeoWhois when country is missing
+// enrichWithCountryFallback adds country information from GeoLite2 Country when country is missing.
 func (ctx *workerContext) enrichWithCountryFallback(ip net.IP, record *MergedRecord) {
 	if record.Country.ISOCode != "" {
 		return

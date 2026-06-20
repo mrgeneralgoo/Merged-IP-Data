@@ -157,14 +157,14 @@ func New() (*Merger, error) {
 	routeViewsASN, err := reader.OpenRouteViewsASN()
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("failed to open RouteViews ASN: %w", err)
+		return nil, fmt.Errorf("failed to open Origin ASN: %w", err)
 	}
 	closers = append(closers, routeViewsASN)
 
 	geoWhoisCountry, err := reader.OpenGeoWhoisCountry()
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("failed to open GeoWhois Country: %w", err)
+		return nil, fmt.Errorf("failed to open GeoLite2 Country: %w", err)
 	}
 	closers = append(closers, geoWhoisCountry)
 
@@ -576,7 +576,7 @@ func (m *Merger) buildMergedRecordFromDBIP(network *net.IPNet, dbipRecord *reade
 	m.enrichWithProxyData(network.IP, record)
 }
 
-// enrichWithCountryFallback adds country information from GeoWhois when country is missing
+// enrichWithCountryFallback adds country information from GeoLite2 Country when country is missing.
 func (m *Merger) enrichWithCountryFallback(ip net.IP, record *MergedRecord) {
 	if record.Country.ISOCode != "" {
 		return
@@ -633,7 +633,7 @@ func (m *Merger) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 	}
 }
 
-// enrichWithASNData adds ASN information from IPinfo Lite (primary), GeoLite2-ASN (secondary), or RouteViews (tertiary).
+// enrichWithASNData adds ASN information from IPinfo Lite (primary), GeoLite2-ASN (secondary), or Origin ASN (tertiary).
 // Uses caching to avoid redundant lookups for IPs within the same ASN network.
 func (m *Merger) enrichWithASNData(ip net.IP, record *MergedRecord) {
 	// Check cache first - if IP is within cached ASN network, reuse the result
@@ -681,7 +681,7 @@ func (m *Merger) enrichWithASNData(ip net.IP, record *MergedRecord) {
 		return
 	}
 
-	// Priority 3: RouteViews ASN
+	// Priority 3: Origin ASN
 	m.reusableRouteViewsRecord.Reset()
 	if network, lookupOK, err := m.routeViewsASN.LookupNetworkTo(ip, &m.reusableRouteViewsRecord); err == nil && lookupOK && m.reusableRouteViewsRecord.HasASN() {
 		m.stats.RouteViewsASNHits++
@@ -1063,9 +1063,9 @@ func (m *Merger) printStats() {
 	fmt.Printf("  GeoLite2-City hits: %d\n", m.stats.GeoLiteCityHits)
 	fmt.Printf("  GeoLite2-ASN hits: %d\n", m.stats.GeoLiteASNHits)
 	fmt.Printf("  IPinfo Lite hits: %d\n", m.stats.IPinfoLiteHits)
-	fmt.Printf("  RouteViews ASN hits: %d\n", m.stats.RouteViewsASNHits)
+	fmt.Printf("  Origin ASN hits: %d\n", m.stats.RouteViewsASNHits)
 	fmt.Printf("  DB-IP supplementary records: %d\n", m.stats.DBIPHits)
-	fmt.Printf("  GeoWhois Country fallback hits: %d\n", m.stats.GeoWhoisCountryHits)
+	fmt.Printf("  GeoLite2 Country fallback hits: %d\n", m.stats.GeoWhoisCountryHits)
 	fmt.Printf("  QQWry (Chunzhen) China enrichment hits: %d\n", m.stats.QQWryHits)
 	fmt.Printf("  OpenProxyDB proxy enrichment hits: %d\n", m.stats.OpenproxyDBHits)
 	fmt.Printf("  OpenProxyDB CIDR ranges inserted: %d\n", m.stats.OpenproxyDBCIDRRangesInserted)

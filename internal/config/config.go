@@ -2,13 +2,15 @@ package config
 
 // Database download URLs
 const (
+	IPLocationDBReleaseBaseURL = "https://github.com/sapics/ip-location-db/releases/download/latest"
+
 	GeoLite2CityURL       = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb"
 	GeoLite2ASNURL        = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
 	IPinfoLiteURL         = "https://github.com/NetworkCats/IPinfoLite-Download/releases/latest/download/ipinfo_lite.mmdb"
-	DBIPCityIPv4URL       = "https://unpkg.com/@ip-location-db/dbip-city-mmdb/dbip-city-ipv4.mmdb"
-	DBIPCityIPv6URL       = "https://unpkg.com/@ip-location-db/dbip-city-mmdb/dbip-city-ipv6.mmdb"
-	RouteViewsASNURL      = "https://cdn.jsdelivr.net/npm/@ip-location-db/asn-mmdb/asn.mmdb"
-	GeoWhoisCountryURL    = "https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-geo-whois-asn-country-mmdb/geolite2-geo-whois-asn-country.mmdb"
+	DBIPCityIPv4URL       = IPLocationDBReleaseBaseURL + "/dbip-city-ipv4.mmdb"
+	DBIPCityIPv6URL       = IPLocationDBReleaseBaseURL + "/dbip-city-ipv6.mmdb"
+	RouteViewsASNURL      = IPLocationDBReleaseBaseURL + "/origin-asn.mmdb"
+	GeoWhoisCountryURL    = IPLocationDBReleaseBaseURL + "/geolite2-country.mmdb"
 	QQWryURL              = "https://cdn.jsdelivr.net/npm/qqwry.ipdb/qqwry.ipdb"
 	OpenproxyDBURL        = "https://github.com/NetworkCats/OpenProxyDB/releases/latest/download/proxy_blocks.csv"
 	ICloudPrivateRelayURL = "https://mask-api.icloud.com/egress-ip-ranges.csv"
@@ -26,8 +28,8 @@ const (
 	IPinfoLiteFile         = "download/ipinfo_lite.mmdb"
 	DBIPCityIPv4File       = "download/dbip-city-ipv4.mmdb"
 	DBIPCityIPv6File       = "download/dbip-city-ipv6.mmdb"
-	RouteViewsASNFile      = "download/routeviews-asn.mmdb"
-	GeoWhoisCountryFile    = "download/geolite2-geo-whois-asn-country.mmdb"
+	RouteViewsASNFile      = "download/origin-asn.mmdb"
+	GeoWhoisCountryFile    = "download/geolite2-country.mmdb"
 	QQWryFile              = "download/qqwry.ipdb"
 	OpenproxyDBFile        = "download/proxy_blocks.csv"
 	ICloudPrivateRelayFile = "download/icloud-private-relay.csv"
@@ -84,8 +86,8 @@ func GetAllSources() []DatabaseSource {
 		{Name: "IPinfo-Lite", URL: IPinfoLiteURL, Path: IPinfoLiteFile},
 		{Name: "DB-IP-IPv4", URL: DBIPCityIPv4URL, Path: DBIPCityIPv4File},
 		{Name: "DB-IP-IPv6", URL: DBIPCityIPv6URL, Path: DBIPCityIPv6File},
-		{Name: "RouteViews-ASN", URL: RouteViewsASNURL, Path: RouteViewsASNFile},
-		{Name: "GeoWhois-Country", URL: GeoWhoisCountryURL, Path: GeoWhoisCountryFile},
+		{Name: "Origin-ASN", URL: RouteViewsASNURL, Path: RouteViewsASNFile},
+		{Name: "GeoLite2-Country", URL: GeoWhoisCountryURL, Path: GeoWhoisCountryFile},
 		{Name: "QQWry-Chunzhen", URL: QQWryURL, Path: QQWryFile},
 		{Name: "OpenProxyDB", URL: OpenproxyDBURL, Path: OpenproxyDBFile},
 		{Name: "iCloud-Private-Relay", URL: ICloudPrivateRelayURL, Path: ICloudPrivateRelayFile},

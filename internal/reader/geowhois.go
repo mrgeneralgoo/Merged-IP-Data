@@ -6,17 +6,17 @@ import (
 	"merged-ip-data/internal/config"
 )
 
-// GeoWhoisCountryRecord represents a record from the GeoLite2-Geo-Whois-ASN-Country database
+// GeoWhoisCountryRecord represents a record from the GeoLite2 Country database.
 type GeoWhoisCountryRecord struct {
 	CountryCode string `maxminddb:"country_code"`
 }
 
-// GeoWhoisCountryReader reads the GeoLite2-Geo-Whois-ASN-Country database
+// GeoWhoisCountryReader reads the GeoLite2 Country database.
 type GeoWhoisCountryReader struct {
 	*Reader
 }
 
-// OpenGeoWhoisCountry opens the GeoLite2-Geo-Whois-ASN-Country database
+// OpenGeoWhoisCountry opens the GeoLite2 Country database.
 func OpenGeoWhoisCountry() (*GeoWhoisCountryReader, error) {
 	r, err := Open(config.GeoWhoisCountryFile)
 	if err != nil {
@@ -25,7 +25,7 @@ func OpenGeoWhoisCountry() (*GeoWhoisCountryReader, error) {
 	return &GeoWhoisCountryReader{Reader: r}, nil
 }
 
-// Lookup looks up an IP address in the GeoWhois Country database
+// Lookup looks up an IP address in the GeoLite2 Country database.
 func (r *GeoWhoisCountryReader) Lookup(ip net.IP) (*GeoWhoisCountryRecord, error) {
 	var record GeoWhoisCountryRecord
 	err := r.Reader.Lookup(ip, &record)
