@@ -102,6 +102,7 @@ type Stats struct {
 	QQWryHits                        int64
 	OpenproxyDBHits                  int64
 	OpenproxyDBCIDRRangesInserted    int64
+	VPNProviderRangesInserted        int64
 	BadASNHits                       int64
 	EmptyRecords                     int64
 	ProcessedNetworks                int64
@@ -193,6 +194,17 @@ func New() (*Merger, error) {
 
 	singleIPs, cidrRanges := openproxyDB.Stats()
 	fmt.Printf("OpenProxyDB loaded: %d single IPs, %d CIDR ranges\n", singleIPs, cidrRanges)
+
+	vpnProviderCount, err := openproxyDB.LoadVPNProviderCIDRRanges(
+		config.X4BMullvadVPNFile,
+		config.X4BPIAVPNFile,
+		config.X4BProtonVPNFile,
+	)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to load VPN provider ranges: %w", err)
+	}
+	fmt.Printf("VPN provider ranges loaded: %d CIDRs merged into VPN/hosting data\n", vpnProviderCount)
 
 	badIPCount, err := openproxyDB.LoadBadIPList(config.BadIPListFile)
 	if err != nil {
@@ -338,6 +350,12 @@ func (m *Merger) Merge() error {
 		return fmt.Errorf("failed to process OpenProxyDB CIDR ranges: %w", err)
 	}
 	logMemStats("After OpenProxyDB CIDR ranges")
+
+	fmt.Println("Processing VPN provider ranges (direct CIDR insertion)...")
+	if err := m.processVPNProviderRanges(); err != nil {
+		return fmt.Errorf("failed to process VPN provider ranges: %w", err)
+	}
+	logMemStats("After VPN provider ranges")
 
 	fmt.Println("Processing iCloud Private Relay ranges (direct CIDR insertion)...")
 	if err := m.processICloudPrivateRelayRanges(); err != nil {
@@ -836,6 +854,48 @@ func (m *Merger) processOpenProxyDBCIDRRanges() error {
 	return nil
 }
 
+// processVPNProviderRanges directly overlays third-party VPN provider CIDRs
+// with VPN and hosting flags.
+func (m *Merger) processVPNProviderRanges() error {
+	ranges := m.openproxyDB.VPNProviderRanges()
+	if len(ranges) == 0 {
+		fmt.Println("VPN provider ranges: 0 inserted, 0 skipped")
+		return nil
+	}
+
+	proxy := ProxyRecord{
+		IsVPN:       true,
+		IsHosting:   true,
+		IsAnonymous: true,
+	}
+	proxyMMDB := proxy.toMMDBType()
+
+	inserted := 0
+	skipped := 0
+	for _, prefix := range ranges {
+		network := netipPrefixToIPNet(prefix)
+		if network == nil {
+			skipped++
+			continue
+		}
+
+		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			fmt.Printf("Warning: failed to insert VPN provider range %s: %v\n", prefix, err)
+			skipped++
+			continue
+		}
+		inserted++
+	}
+
+	fmt.Printf("VPN provider ranges: %d inserted, %d skipped (of %d total)\n", inserted, skipped, len(ranges))
+	m.stats.VPNProviderRangesInserted = int64(inserted)
+	return nil
+}
+
 // processAnycastPrefixes directly overlays bgp.tools anycast prefixes with
 // the CDN flag. This avoids relying on geo/ASN source network boundaries to
 // happen to align with anycast CIDRs.
@@ -1069,6 +1129,7 @@ func (m *Merger) printStats() {
 	fmt.Printf("  QQWry (Chunzhen) China enrichment hits: %d\n", m.stats.QQWryHits)
 	fmt.Printf("  OpenProxyDB proxy enrichment hits: %d\n", m.stats.OpenproxyDBHits)
 	fmt.Printf("  OpenProxyDB CIDR ranges inserted: %d\n", m.stats.OpenproxyDBCIDRRangesInserted)
+	fmt.Printf("  VPN provider ranges inserted: %d\n", m.stats.VPNProviderRangesInserted)
 	fmt.Printf("  Bad ASN fallback hits: %d\n", m.stats.BadASNHits)
 	fmt.Printf("  iCloud Private Relay ranges inserted: %d\n", m.stats.ICloudPrivateRelayRangesInserted)
 	fmt.Printf("  Anycast prefixes inserted: %d\n", m.stats.AnycastPrefixesInserted)

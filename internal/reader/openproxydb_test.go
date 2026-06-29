@@ -168,6 +168,61 @@ func TestCIDRRangesExcludeSupplementaryICloudRanges(t *testing.T) {
 	}
 }
 
+func TestLoadVPNProviderCIDRRangesMarksVPNAndHosting(t *testing.T) {
+	path := writeTempFile(t, "vpn-provider-*.txt", "# comment\n198.51.100.1/24 2001:db8:abcd::/48 # trailing comment\n::ffff:203.0.113.9\n")
+	r := &OpenproxyDBReader{
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges:  make([]cidrEntry, 0),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+
+	count, err := r.LoadVPNProviderCIDRRanges(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+	if got := len(r.VPNProviderRanges()); got != 3 {
+		t.Fatalf("VPN provider range count = %d, want 3", got)
+	}
+
+	for _, ip := range []string{"198.51.100.42", "2001:db8:abcd::1234", "203.0.113.9"} {
+		var record OpenproxyDBRecord
+		if !r.LookupTo(net.ParseIP(ip), &record) {
+			t.Fatalf("expected lookup for %s to match VPN provider range", ip)
+		}
+		if record.IsProxy || !record.IsVPN || !record.IsHosting || !record.IsAnonymous {
+			t.Fatalf("record for %s = %+v, want VPN, hosting, and anonymous only", ip, record)
+		}
+	}
+}
+
+func TestCIDRRangesExcludeSupplementaryVPNProviderRanges(t *testing.T) {
+	path := writeTempFile(t, "vpn-provider-*.txt", "192.0.2.0/24\n")
+	r := &OpenproxyDBReader{
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges:  make([]cidrEntry, 0),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+	r.addCIDRRange(netip.MustParsePrefix("198.51.100.0/24"), OpenproxyDBRecord{IsHosting: true})
+
+	if _, err := r.LoadVPNProviderCIDRRanges(path); err != nil {
+		t.Fatal(err)
+	}
+
+	ranges := r.CIDRRanges()
+	if len(ranges) != 1 {
+		t.Fatalf("CIDRRanges length = %d, want only original OpenProxyDB range", len(ranges))
+	}
+	if ranges[0].Prefix != netip.MustParsePrefix("198.51.100.0/24") {
+		t.Fatalf("CIDRRanges[0] = %s, want original range", ranges[0].Prefix)
+	}
+	if got := len(r.VPNProviderRanges()); got != 1 {
+		t.Fatalf("VPN provider range count = %d, want 1", got)
+	}
+}
+
 func TestLoadAnycastPrefixesExposesNormalizedPrefixes(t *testing.T) {
 	path := writeTempFile(t, "anycast-*.txt", "::ffff:203.0.113.0/120\n2001:db8::/32\n")
 	r := &OpenproxyDBReader{

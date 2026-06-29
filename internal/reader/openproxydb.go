@@ -33,6 +33,7 @@ type cidrRangeSource uint8
 const (
 	cidrRangeSourceOpenproxy cidrRangeSource = iota
 	cidrRangeSourceICloud
+	cidrRangeSourceVPNProvider
 )
 
 // cidrEntry holds a CIDR prefix and its associated proxy record
@@ -71,6 +72,10 @@ type OpenproxyDBReader struct {
 	// icloudPrivateRelayRanges stores the source CIDRs from Apple's iCloud
 	// Private Relay egress list so the merger can overlay them exactly.
 	icloudPrivateRelayRanges []netip.Prefix
+
+	// vpnProviderRanges stores third-party VPN provider CIDR feeds that should
+	// be overlaid exactly as VPN and hosting networks.
+	vpnProviderRanges []netip.Prefix
 
 	// anycastSet holds the union of bgp.tools anycast prefixes (v4 + v6).
 	// Any IP contained in this set gets IsCDN=true OR'd onto its OpenProxyDB
