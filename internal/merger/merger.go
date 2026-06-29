@@ -69,6 +69,7 @@ type Merger struct {
 	qqwry           *reader.QQWryReader
 	openproxyDB     *reader.OpenproxyDBReader
 	badASN          *reader.BadASNReader
+	asnOverlay      *reader.ASNOverlayReader
 
 	tree *mmdbwriter.Tree
 
@@ -103,6 +104,8 @@ type Stats struct {
 	OpenproxyDBHits                  int64
 	OpenproxyDBCIDRRangesInserted    int64
 	VPNProviderRangesInserted        int64
+	ASNOverlayHits                   int64
+	ASNOverlayNetworksInserted       int64
 	BadASNHits                       int64
 	EmptyRecords                     int64
 	ProcessedNetworks                int64
@@ -192,6 +195,27 @@ func New() (*Merger, error) {
 	fmt.Printf("Bad ASN list loaded: %d ASNs (includes %d manual entries)\n",
 		badASN.Count(), len(reader.ManuallyAddedBadASNs))
 
+	asnOverlay, err := reader.OpenASNOverlayLists(
+		reader.ASNOverlaySource{
+			Path: config.X4BVPNASNFile,
+			Record: reader.OpenproxyDBRecord{
+				IsVPN: true,
+			},
+		},
+		reader.ASNOverlaySource{
+			Path: config.X4BDatacenterASNFile,
+			Record: reader.OpenproxyDBRecord{
+				IsHosting: true,
+			},
+		},
+	)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to open ASN proxy overlays: %w", err)
+	}
+	closers = append(closers, asnOverlay)
+	fmt.Printf("ASN proxy overlays loaded: %d ASNs merged into VPN/hosting data\n", asnOverlay.Count())
+
 	singleIPs, cidrRanges := openproxyDB.Stats()
 	fmt.Printf("OpenProxyDB loaded: %d single IPs, %d CIDR ranges\n", singleIPs, cidrRanges)
 
@@ -199,12 +223,25 @@ func New() (*Merger, error) {
 		config.X4BMullvadVPNFile,
 		config.X4BPIAVPNFile,
 		config.X4BProtonVPNFile,
+		config.X4BDatacenterProtonFile,
 	)
 	if err != nil {
 		cleanup()
 		return nil, fmt.Errorf("failed to load VPN provider ranges: %w", err)
 	}
 	fmt.Printf("VPN provider ranges loaded: %d CIDRs merged into VPN/hosting data\n", vpnProviderCount)
+
+	nordVPNCount, err := openproxyDB.LoadVPNProviderCIDRRangesWithRecord(
+		reader.OpenproxyDBRecord{
+			IsVPN: true,
+		},
+		config.NordVPNIPListFile,
+	)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to load NordVPN IP ranges: %w", err)
+	}
+	fmt.Printf("NordVPN IPs loaded: %d entries merged into VPN data\n", nordVPNCount)
 
 	badIPCount, err := openproxyDB.LoadBadIPList(config.BadIPListFile)
 	if err != nil {
@@ -262,6 +299,7 @@ func New() (*Merger, error) {
 		qqwry:           qqwry,
 		openproxyDB:     openproxyDB,
 		badASN:          badASN,
+		asnOverlay:      asnOverlay,
 		tree:            tree,
 	}, nil
 }
@@ -315,6 +353,11 @@ func (m *Merger) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if m.asnOverlay != nil {
+		if err := m.asnOverlay.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors closing readers: %v", errs)
@@ -344,6 +387,12 @@ func (m *Merger) Merge() error {
 		return fmt.Errorf("failed to process DB-IP: %w", err)
 	}
 	logMemStats("After DB-IP")
+
+	fmt.Println("Processing ASN proxy overlays (direct ASN network insertion)...")
+	if err := m.processASNOverlayNetworks(); err != nil {
+		return fmt.Errorf("failed to process ASN proxy overlays: %w", err)
+	}
+	logMemStats("After ASN proxy overlays")
 
 	fmt.Println("Processing OpenProxyDB CIDR ranges (direct CIDR insertion)...")
 	if err := m.processOpenProxyDBCIDRRanges(); err != nil {
@@ -405,6 +454,7 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 		m.qqwry,
 		m.openproxyDB,
 		m.badASN,
+		m.asnOverlay,
 	)
 
 	// Start workers
@@ -479,6 +529,7 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 	m.stats.GeoWhoisCountryHits = workerStats.GeoWhoisCountryHits
 	m.stats.QQWryHits = workerStats.QQWryHits
 	m.stats.OpenproxyDBHits = workerStats.OpenproxyDBHits
+	m.stats.ASNOverlayHits = workerStats.ASNOverlayHits
 	m.stats.BadASNHits = workerStats.BadASNHits
 	m.stats.EmptyRecords = workerStats.EmptyRecords
 	m.stats.ProcessedNetworks = insertedCount
@@ -752,12 +803,116 @@ func (m *Merger) enrichWithProxyData(ip net.IP, record *MergedRecord) {
 
 	applySchoolASNMatch(record)
 
+	if applyASNProxyOverlay(record, m.asnOverlay) {
+		m.stats.ASNOverlayHits++
+	}
+
 	if !record.Proxy.IsProxy && record.ASN.Number != 0 && m.badASN.Contains(record.ASN.Number) {
 		m.stats.BadASNHits++
 		record.Proxy.IsProxy = true
 		record.Proxy.IsHosting = true
 		record.Proxy.IsAnonymous = true
 	}
+}
+
+func applyASNProxyOverlay(record *MergedRecord, asnOverlay *reader.ASNOverlayReader) bool {
+	if record.ASN.Number == 0 || asnOverlay == nil {
+		return false
+	}
+	overlay, ok := asnOverlay.Lookup(record.ASN.Number)
+	if !ok {
+		return false
+	}
+	mergeProxyOverlay(&record.Proxy, overlay)
+	return true
+}
+
+func mergeProxyOverlay(proxy *ProxyRecord, overlay reader.OpenproxyDBRecord) {
+	proxy.IsProxy = proxy.IsProxy || overlay.IsProxy
+	proxy.IsVPN = proxy.IsVPN || overlay.IsVPN
+	proxy.IsTor = proxy.IsTor || overlay.IsTor
+	proxy.IsHosting = proxy.IsHosting || overlay.IsHosting
+	proxy.IsCDN = proxy.IsCDN || overlay.IsCDN
+	proxy.IsSchool = proxy.IsSchool || overlay.IsSchool
+	proxy.IsAnonymous = proxy.IsAnonymous || overlay.IsAnonymous
+	if proxy.IsProxy || proxy.IsVPN || proxy.IsTor {
+		proxy.IsAnonymous = true
+	}
+}
+
+func proxyRecordFromOpenproxy(record reader.OpenproxyDBRecord) ProxyRecord {
+	proxy := ProxyRecord{
+		IsProxy:     record.IsProxy,
+		IsVPN:       record.IsVPN,
+		IsTor:       record.IsTor,
+		IsHosting:   record.IsHosting,
+		IsCDN:       record.IsCDN,
+		IsSchool:    record.IsSchool,
+		IsAnonymous: record.IsAnonymous,
+	}
+	if proxy.IsProxy || proxy.IsVPN || proxy.IsTor {
+		proxy.IsAnonymous = true
+	}
+	return proxy
+}
+
+// processASNOverlayNetworks directly overlays IPinfo ASN networks whose ASNs
+// appear in the configured ASN proxy lists. IPinfo Lite is the primary ASN
+// source for this project; lookup-time enrichment still applies overlays when
+// records fall back to GeoLite2-ASN or Origin ASN.
+func (m *Merger) processASNOverlayNetworks() error {
+	if m.asnOverlay == nil || m.asnOverlay.Count() == 0 {
+		fmt.Println("ASN proxy overlay networks: 0 inserted, 0 skipped")
+		return nil
+	}
+
+	networks := m.ipinfoLite.Networks()
+	inserted := 0
+	skipped := 0
+
+	for networks.Next() {
+		var record reader.IPinfoLiteRecord
+		network, err := networks.Network(&record)
+		if err != nil {
+			fmt.Printf("Warning: failed to read IPinfo ASN network: %v\n", err)
+			skipped++
+			continue
+		}
+		if !record.HasASN() {
+			continue
+		}
+
+		overlay, ok := m.asnOverlay.Lookup(record.GetASNumber())
+		if !ok {
+			continue
+		}
+
+		proxy := proxyRecordFromOpenproxy(overlay)
+		proxyMMDB := proxy.toMMDBType()
+		if proxyMMDB == nil {
+			skipped++
+			continue
+		}
+
+		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			fmt.Printf("Warning: failed to insert ASN proxy overlay network %s: %v\n", network, err)
+			skipped++
+			continue
+		}
+		inserted++
+	}
+
+	if err := networks.Err(); err != nil {
+		return err
+	}
+
+	fmt.Printf("ASN proxy overlay networks: %d inserted, %d skipped\n", inserted, skipped)
+	m.stats.ASNOverlayNetworksInserted = int64(inserted)
+	return nil
 }
 
 // processICloudPrivateRelayRanges directly overlays every Apple-published
@@ -855,7 +1010,7 @@ func (m *Merger) processOpenProxyDBCIDRRanges() error {
 }
 
 // processVPNProviderRanges directly overlays third-party VPN provider CIDRs
-// with VPN and hosting flags.
+// with their configured proxy flags.
 func (m *Merger) processVPNProviderRanges() error {
 	ranges := m.openproxyDB.VPNProviderRanges()
 	if len(ranges) == 0 {
@@ -863,17 +1018,17 @@ func (m *Merger) processVPNProviderRanges() error {
 		return nil
 	}
 
-	proxy := ProxyRecord{
-		IsVPN:       true,
-		IsHosting:   true,
-		IsAnonymous: true,
-	}
-	proxyMMDB := proxy.toMMDBType()
-
 	inserted := 0
 	skipped := 0
-	for _, prefix := range ranges {
-		network := netipPrefixToIPNet(prefix)
+	for _, cidrRange := range ranges {
+		proxy := proxyRecordFromOpenproxy(cidrRange.Record)
+		proxyMMDB := proxy.toMMDBType()
+		if proxyMMDB == nil {
+			skipped++
+			continue
+		}
+
+		network := netipPrefixToIPNet(cidrRange.Prefix)
 		if network == nil {
 			skipped++
 			continue
@@ -884,7 +1039,7 @@ func (m *Merger) processVPNProviderRanges() error {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert VPN provider range %s: %v\n", prefix, err)
+			fmt.Printf("Warning: failed to insert VPN provider range %s: %v\n", cidrRange.Prefix, err)
 			skipped++
 			continue
 		}
@@ -1130,6 +1285,8 @@ func (m *Merger) printStats() {
 	fmt.Printf("  OpenProxyDB proxy enrichment hits: %d\n", m.stats.OpenproxyDBHits)
 	fmt.Printf("  OpenProxyDB CIDR ranges inserted: %d\n", m.stats.OpenproxyDBCIDRRangesInserted)
 	fmt.Printf("  VPN provider ranges inserted: %d\n", m.stats.VPNProviderRangesInserted)
+	fmt.Printf("  ASN proxy overlay hits: %d\n", m.stats.ASNOverlayHits)
+	fmt.Printf("  ASN proxy overlay networks inserted: %d\n", m.stats.ASNOverlayNetworksInserted)
 	fmt.Printf("  Bad ASN fallback hits: %d\n", m.stats.BadASNHits)
 	fmt.Printf("  iCloud Private Relay ranges inserted: %d\n", m.stats.ICloudPrivateRelayRangesInserted)
 	fmt.Printf("  Anycast prefixes inserted: %d\n", m.stats.AnycastPrefixesInserted)

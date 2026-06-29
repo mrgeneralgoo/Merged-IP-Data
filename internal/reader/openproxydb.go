@@ -74,8 +74,8 @@ type OpenproxyDBReader struct {
 	icloudPrivateRelayRanges []netip.Prefix
 
 	// vpnProviderRanges stores third-party VPN provider CIDR feeds that should
-	// be overlaid exactly as VPN and hosting networks.
-	vpnProviderRanges []netip.Prefix
+	// be overlaid exactly with their source-specific proxy flags.
+	vpnProviderRanges []CIDRRange
 
 	// anycastSet holds the union of bgp.tools anycast prefixes (v4 + v6).
 	// Any IP contained in this set gets IsCDN=true OR'd onto its OpenProxyDB

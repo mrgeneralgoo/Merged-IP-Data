@@ -15,7 +15,8 @@ A Go program that merges multiple IP geolocation databases into a single, compre
 | [QQWry (Chunzhen)](https://github.com/metowolf/qqwry.ipdb) | Enhanced Chinese IP geolocation with native zh-CN names | IPv4 |
 | [OpenProxyDB](https://github.com/NetworkCats/OpenProxyDB) | Proxy, VPN, Tor, hosting, and CDN detection | IPv4 + IPv6 |
 | [iCloud Private Relay](https://mask-api.icloud.com/egress-ip-ranges.csv) | Proxy and VPN overlay for Apple iCloud Private Relay egress ranges | IPv4 + IPv6 |
-| [X4B VPN lists](https://github.com/X4BNet/lists_vpn) | VPN and hosting overlay for Mullvad, Private Internet Access, and Proton VPN CIDRs | IPv4 |
+| [X4B VPN lists](https://github.com/X4BNet/lists_vpn) | VPN ASN, hosting ASN, and VPN/hosting CIDR overlays for provider and datacenter ranges | IPv4 |
+| [NordVPN server IP list](https://gist.github.com/JamoCA/eedaf4f7cce1cb0aeb5c1039af35f0b7) | VPN overlay for NordVPN server IPs | IPv4 |
 | [bgp.tools Anycast](https://github.com/bgptools/anycast-prefixes) | CDN overlay for anycast prefixes (OR'd into `is_cdn`) | IPv4 + IPv6 |
 
 ## Output Format
@@ -129,5 +130,6 @@ This project merges data from multiple sources. Please refer to each source's li
 - Origin ASN: [CDLA Permissive 2.0](https://cdla.dev/permissive-2-0/)
 - OpenProxyDB: [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
 - X4B VPN lists: [MIT License](https://github.com/X4BNet/lists_vpn#license)
+- NordVPN server IP list: see the source gist for terms
 
 The merge tool source code is provided as-is for educational and personal use.

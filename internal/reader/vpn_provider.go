@@ -13,11 +13,18 @@ import (
 // Blank lines are skipped, '#' starts a comment, and whitespace can separate
 // prefixes on the same line.
 func (r *OpenproxyDBReader) LoadVPNProviderCIDRRanges(paths ...string) (int, error) {
-	record := OpenproxyDBRecord{
+	return r.LoadVPNProviderCIDRRangesWithRecord(OpenproxyDBRecord{
 		IsVPN:       true,
 		IsHosting:   true,
 		IsAnonymous: true,
-	}
+	}, paths...)
+}
+
+// LoadVPNProviderCIDRRangesWithRecord reads one or more plain-text provider
+// prefix files and merges each prefix into the proxy data with the supplied
+// flags.
+func (r *OpenproxyDBReader) LoadVPNProviderCIDRRangesWithRecord(record OpenproxyDBRecord, paths ...string) (int, error) {
+	record = normalizeOpenproxyRecord(record)
 
 	count := 0
 	for _, path := range paths {
@@ -63,7 +70,10 @@ func (r *OpenproxyDBReader) loadVPNProviderCIDRFile(path string, record Openprox
 
 			prefix = canonicalPrefix(prefix)
 			r.addCIDRRangeWithSource(prefix, record, cidrRangeSourceVPNProvider)
-			r.vpnProviderRanges = append(r.vpnProviderRanges, prefix)
+			r.vpnProviderRanges = append(r.vpnProviderRanges, CIDRRange{
+				Prefix: prefix,
+				Record: record,
+			})
 			count++
 		}
 	}
@@ -94,6 +104,6 @@ func parseCIDROrAddrPrefix(token string) (netip.Prefix, error) {
 }
 
 // VPNProviderRanges returns the loaded third-party VPN provider CIDRs.
-func (r *OpenproxyDBReader) VPNProviderRanges() []netip.Prefix {
-	return r.vpnProviderRanges
+func (r *OpenproxyDBReader) VPNProviderRanges() []CIDRRange {
+	return append([]CIDRRange(nil), r.vpnProviderRanges...)
 }

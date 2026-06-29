@@ -198,6 +198,43 @@ func TestLoadVPNProviderCIDRRangesMarksVPNAndHosting(t *testing.T) {
 	}
 }
 
+func TestLoadVPNProviderCIDRRangesWithRecordMarksVPNOnly(t *testing.T) {
+	path := writeTempFile(t, "vpn-provider-*.txt", "198.51.100.42\n2001:db8:abcd::/48\n")
+	r := &OpenproxyDBReader{
+		singleIPs:   make(map[netip.Addr]OpenproxyDBRecord),
+		cidrRanges:  make([]cidrEntry, 0),
+		cidrRecords: make(map[netip.Prefix]OpenproxyDBRecord),
+	}
+
+	count, err := r.LoadVPNProviderCIDRRangesWithRecord(OpenproxyDBRecord{IsVPN: true}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	ranges := r.VPNProviderRanges()
+	if got := len(ranges); got != 2 {
+		t.Fatalf("VPN provider range count = %d, want 2", got)
+	}
+	for _, cidrRange := range ranges {
+		if !cidrRange.Record.IsVPN || cidrRange.Record.IsHosting || !cidrRange.Record.IsAnonymous {
+			t.Fatalf("VPNProviderRanges record = %+v, want VPN and anonymous only", cidrRange.Record)
+		}
+	}
+
+	for _, ip := range []string{"198.51.100.42", "2001:db8:abcd::1234"} {
+		var record OpenproxyDBRecord
+		if !r.LookupTo(net.ParseIP(ip), &record) {
+			t.Fatalf("expected lookup for %s to match VPN provider range", ip)
+		}
+		if record.IsProxy || !record.IsVPN || record.IsHosting || !record.IsAnonymous {
+			t.Fatalf("record for %s = %+v, want VPN and anonymous only", ip, record)
+		}
+	}
+}
+
 func TestCIDRRangesExcludeSupplementaryVPNProviderRanges(t *testing.T) {
 	path := writeTempFile(t, "vpn-provider-*.txt", "192.0.2.0/24\n")
 	r := &OpenproxyDBReader{

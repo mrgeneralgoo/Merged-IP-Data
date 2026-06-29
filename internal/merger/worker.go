@@ -33,6 +33,7 @@ type workerContext struct {
 	qqwry           *reader.QQWryReader
 	openproxyDB     *reader.OpenproxyDBReader
 	badASN          *reader.BadASNReader
+	asnOverlay      *reader.ASNOverlayReader
 
 	// Per-worker reusable records (not shared between workers)
 	reusableIPinfoRecord     reader.IPinfoLiteRecord
@@ -62,6 +63,7 @@ type workerStats struct {
 	geoWhoisCountryHits int64
 	qqwryHits           int64
 	openproxyDBHits     int64
+	asnOverlayHits      int64
 	badASNHits          int64
 	emptyRecords        int64
 	processedNetworks   int64
@@ -89,6 +91,7 @@ func newWorkerPool(
 	qqwry *reader.QQWryReader,
 	openproxyDB *reader.OpenproxyDBReader,
 	badASN *reader.BadASNReader,
+	asnOverlay *reader.ASNOverlayReader,
 ) *workerPool {
 	if numWorkers <= 0 {
 		numWorkers = mergeWorkerCount()
@@ -116,6 +119,7 @@ func newWorkerPool(
 			qqwry:           qqwry,
 			openproxyDB:     openproxyDB,
 			badASN:          badASN,
+			asnOverlay:      asnOverlay,
 		}
 	}
 
@@ -165,6 +169,7 @@ func (p *workerPool) aggregateStats() Stats {
 		stats.GeoWhoisCountryHits += ctx.stats.geoWhoisCountryHits
 		stats.QQWryHits += ctx.stats.qqwryHits
 		stats.OpenproxyDBHits += ctx.stats.openproxyDBHits
+		stats.ASNOverlayHits += ctx.stats.asnOverlayHits
 		stats.BadASNHits += ctx.stats.badASNHits
 		stats.EmptyRecords += ctx.stats.emptyRecords
 		stats.ProcessedNetworks += ctx.stats.processedNetworks
@@ -416,6 +421,10 @@ func (ctx *workerContext) enrichWithProxyData(ip net.IP, record *MergedRecord) {
 	}
 
 	applySchoolASNMatch(record)
+
+	if applyASNProxyOverlay(record, ctx.asnOverlay) {
+		ctx.stats.asnOverlayHits++
+	}
 
 	if !record.Proxy.IsProxy && record.ASN.Number != 0 && ctx.badASN.Contains(record.ASN.Number) {
 		ctx.stats.badASNHits++
