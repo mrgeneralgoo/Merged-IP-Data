@@ -84,6 +84,37 @@ func TestOpenproxyDBDuplicateCIDRRecordsAreUnioned(t *testing.T) {
 	}
 }
 
+func TestOpenproxyDBDuplicateSingleIPRecordsAreUnioned(t *testing.T) {
+	path := writeTempFile(t, "proxy-*.csv", "ip,anonblock,proxy,vpn,cdn,rangeblock,school-block,tor,webhost\n203.0.113.8,false,false,true,false,false,false,false,false\n203.0.113.8,false,false,false,false,false,false,false,true\n")
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	r := &OpenproxyDBReader{singleIPs: make(map[netip.Addr]OpenproxyDBRecord)}
+	if err := r.parse(file); err != nil {
+		t.Fatal(err)
+	}
+
+	var record OpenproxyDBRecord
+	if !r.LookupTo(net.ParseIP("203.0.113.8"), &record) {
+		t.Fatal("expected single-IP lookup match")
+	}
+	if !record.IsVPN || !record.IsHosting || !record.IsAnonymous {
+		t.Fatalf("record = %+v, want unioned VPN, hosting, and anonymous flags", record)
+	}
+}
+
+func TestCanonicalPrefixDoesNotBroadenMappedIPv4Supernet(t *testing.T) {
+	prefix := canonicalPrefix(netip.MustParsePrefix("::ffff:192.0.2.1/80"))
+	want := netip.MustParsePrefix("::/80")
+	if prefix != want {
+		t.Fatalf("canonicalPrefix() = %s, want %s", prefix, want)
+	}
+}
+
 func TestLoadBadIPListUnmapsIPv4AndInheritsCIDRFlags(t *testing.T) {
 	path := writeTempFile(t, "badip-*.txt", "::ffff:192.0.2.1\n")
 	r := &OpenproxyDBReader{

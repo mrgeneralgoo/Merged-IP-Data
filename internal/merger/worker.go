@@ -22,51 +22,28 @@ type resultItem struct {
 	mmdbRecord mmdbtype.Map
 }
 
-// workerContext holds the per-worker state for enrichment lookups.
+// workerContext holds the per-worker state for country and QQWry lookups.
 // Each worker has its own context to avoid contention.
 type workerContext struct {
 	// Database readers (shared, read-only)
-	ipinfoLite      *reader.IPinfoLiteReader
-	geoLiteASN      *reader.GeoLite2ASNReader
-	routeViewsASN   *reader.RouteViewsASNReader
 	geoWhoisCountry *reader.GeoWhoisCountryReader
 	qqwry           *reader.QQWryReader
-	openproxyDB     *reader.OpenproxyDBReader
-	badASN          *reader.BadASNReader
-	asnOverlay      *reader.ASNOverlayReader
 
 	// Per-worker reusable records (not shared between workers)
-	reusableIPinfoRecord     reader.IPinfoLiteRecord
-	reusableGeoLiteASNRecord reader.GeoLite2ASNRecord
-	reusableRouteViewsRecord reader.RouteViewsASNRecord
-	reusableGeoWhoisRecord   reader.GeoWhoisCountryRecord
-	reusableQQWryRecord      reader.QQWryRecord
-	reusableOpenproxyRecord  reader.OpenproxyDBRecord
-	reusableMergedRecord     MergedRecord
+	reusableGeoWhoisRecord reader.GeoWhoisCountryRecord
+	reusableQQWryRecord    reader.QQWryRecord
+	reusableMergedRecord   MergedRecord
 
-	// Per-worker ASN cache
-	cachedASN        ASNRecord
-	cachedASNNetwork *net.IPNet
-	cachedASNSource  asnSource
-	cachedASNValid   bool
-
-	// Per-worker statistics (atomically updated)
+	// Per-worker statistics; each context is owned by one worker.
 	stats workerStats
 }
 
 // workerStats holds per-worker statistics
 type workerStats struct {
 	geoLiteCityHits     int64
-	geoLiteASNHits      int64
-	ipinfoLiteHits      int64
-	routeViewsASNHits   int64
 	geoWhoisCountryHits int64
 	qqwryHits           int64
-	openproxyDBHits     int64
-	asnOverlayHits      int64
-	badASNHits          int64
 	emptyRecords        int64
-	processedNetworks   int64
 }
 
 // workerPool manages a pool of workers for parallel processing
@@ -84,14 +61,8 @@ type workerPool struct {
 // newWorkerPool creates a new worker pool with the specified number of workers
 func newWorkerPool(
 	numWorkers int,
-	ipinfoLite *reader.IPinfoLiteReader,
-	geoLiteASN *reader.GeoLite2ASNReader,
-	routeViewsASN *reader.RouteViewsASNReader,
 	geoWhoisCountry *reader.GeoWhoisCountryReader,
 	qqwry *reader.QQWryReader,
-	openproxyDB *reader.OpenproxyDBReader,
-	badASN *reader.BadASNReader,
-	asnOverlay *reader.ASNOverlayReader,
 ) *workerPool {
 	if numWorkers <= 0 {
 		numWorkers = mergeWorkerCount()
@@ -112,14 +83,8 @@ func newWorkerPool(
 	// Create worker contexts with shared readers but per-worker reusable records
 	for i := 0; i < numWorkers; i++ {
 		pool.contexts[i] = &workerContext{
-			ipinfoLite:      ipinfoLite,
-			geoLiteASN:      geoLiteASN,
-			routeViewsASN:   routeViewsASN,
 			geoWhoisCountry: geoWhoisCountry,
 			qqwry:           qqwry,
-			openproxyDB:     openproxyDB,
-			badASN:          badASN,
-			asnOverlay:      asnOverlay,
 		}
 	}
 
@@ -163,16 +128,9 @@ func (p *workerPool) aggregateStats() Stats {
 
 	for _, ctx := range p.contexts {
 		stats.GeoLiteCityHits += ctx.stats.geoLiteCityHits
-		stats.GeoLiteASNHits += ctx.stats.geoLiteASNHits
-		stats.IPinfoLiteHits += ctx.stats.ipinfoLiteHits
-		stats.RouteViewsASNHits += ctx.stats.routeViewsASNHits
 		stats.GeoWhoisCountryHits += ctx.stats.geoWhoisCountryHits
 		stats.QQWryHits += ctx.stats.qqwryHits
-		stats.OpenproxyDBHits += ctx.stats.openproxyDBHits
-		stats.ASNOverlayHits += ctx.stats.asnOverlayHits
-		stats.BadASNHits += ctx.stats.badASNHits
 		stats.EmptyRecords += ctx.stats.emptyRecords
-		stats.ProcessedNetworks += ctx.stats.processedNetworks
 	}
 
 	return stats
@@ -203,8 +161,6 @@ func (ctx *workerContext) processWorkItem(item workItem) resultItem {
 		ctx.stats.emptyRecords++
 		return resultItem{network: item.network, mmdbRecord: nil}
 	}
-
-	ctx.stats.processedNetworks++
 
 	return resultItem{
 		network:    item.network,
@@ -268,88 +224,8 @@ func (ctx *workerContext) buildMergedRecord(network *net.IPNet, geoRecord *reade
 		}
 	}
 
-	ctx.enrichWithASNData(network.IP, record)
 	ctx.enrichWithCountryFallback(network.IP, record)
 	ctx.enrichWithQQWryData(network.IP, record)
-	ctx.enrichWithProxyData(network.IP, record)
-}
-
-// enrichWithASNData adds ASN information with caching
-func (ctx *workerContext) enrichWithASNData(ip net.IP, record *MergedRecord) {
-	// Check cache first
-	if ctx.cachedASNValid && ctx.cachedASNNetwork != nil && ctx.cachedASNNetwork.Contains(ip) {
-		if ctx.cachedASN.Number != 0 {
-			record.ASN = ctx.cachedASN
-			ctx.incrementASNHit(ctx.cachedASNSource)
-		}
-		return
-	}
-
-	ctx.cachedASNValid = false
-	ctx.cachedASNNetwork = nil
-	ctx.cachedASNSource = asnSourceNone
-
-	// Priority 1: IPinfo Lite
-	ctx.reusableIPinfoRecord.Reset()
-	if network, ok, err := ctx.ipinfoLite.LookupNetworkTo(ip, &ctx.reusableIPinfoRecord); err == nil && ok && ctx.reusableIPinfoRecord.HasASN() {
-		ctx.stats.ipinfoLiteHits++
-		record.ASN = ASNRecord{
-			Number:       ctx.reusableIPinfoRecord.GetASNumber(),
-			Organization: ctx.reusableIPinfoRecord.ASName,
-			Domain:       ctx.reusableIPinfoRecord.ASDomain,
-		}
-		ctx.cachedASN = record.ASN
-		ctx.cachedASNNetwork = network
-		ctx.cachedASNSource = asnSourceIPinfo
-		ctx.cachedASNValid = true
-		return
-	}
-
-	// Priority 2: GeoLite2-ASN
-	ctx.reusableGeoLiteASNRecord.Reset()
-	if network, ok, err := ctx.geoLiteASN.LookupNetworkTo(ip, &ctx.reusableGeoLiteASNRecord); err == nil && ok && ctx.reusableGeoLiteASNRecord.HasASN() {
-		ctx.stats.geoLiteASNHits++
-		record.ASN = ASNRecord{
-			Number:       ctx.reusableGeoLiteASNRecord.AutonomousSystemNumber,
-			Organization: ctx.reusableGeoLiteASNRecord.AutonomousSystemOrganization,
-		}
-		ctx.cachedASN = record.ASN
-		ctx.cachedASNNetwork = network
-		ctx.cachedASNSource = asnSourceGeoLite
-		ctx.cachedASNValid = true
-		return
-	}
-
-	// Priority 3: Origin ASN
-	ctx.reusableRouteViewsRecord.Reset()
-	if network, ok, err := ctx.routeViewsASN.LookupNetworkTo(ip, &ctx.reusableRouteViewsRecord); err == nil && ok && ctx.reusableRouteViewsRecord.HasASN() {
-		ctx.stats.routeViewsASNHits++
-		record.ASN = ASNRecord{
-			Number:       ctx.reusableRouteViewsRecord.AutonomousSystemNumber,
-			Organization: ctx.reusableRouteViewsRecord.AutonomousSystemOrganization,
-		}
-		ctx.cachedASN = record.ASN
-		ctx.cachedASNNetwork = network
-		ctx.cachedASNSource = asnSourceRouteViews
-		ctx.cachedASNValid = true
-		return
-	}
-
-	// No ASN found
-	ctx.cachedASN = ASNRecord{}
-	ctx.cachedASNSource = asnSourceNone
-	ctx.cachedASNValid = true
-}
-
-func (ctx *workerContext) incrementASNHit(source asnSource) {
-	switch source {
-	case asnSourceIPinfo:
-		ctx.stats.ipinfoLiteHits++
-	case asnSourceGeoLite:
-		ctx.stats.geoLiteASNHits++
-	case asnSourceRouteViews:
-		ctx.stats.routeViewsASNHits++
-	}
 }
 
 // enrichWithCountryFallback adds country information from GeoLite2 Country when country is missing.
@@ -398,38 +274,5 @@ func (ctx *workerContext) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 
 	if _, ok := record.Country.Names["zh-CN"]; !ok {
 		record.Country.Names = withName(record.Country.Names, "zh-CN", ctx.reusableQQWryRecord.CountryName)
-	}
-}
-
-// enrichWithProxyData adds proxy/anonymity information from OpenProxyDB, with
-// a bad-ASN fallback: if OpenProxyDB did not flag the IP as a proxy but the
-// ASN resolved earlier is in the bad ASN list, overlay IsProxy/IsHosting/
-// IsAnonymous onto whatever proxy record is already present.
-func (ctx *workerContext) enrichWithProxyData(ip net.IP, record *MergedRecord) {
-	ctx.reusableOpenproxyRecord.Reset()
-	if ctx.openproxyDB.LookupTo(ip, &ctx.reusableOpenproxyRecord) {
-		ctx.stats.openproxyDBHits++
-		record.Proxy = ProxyRecord{
-			IsProxy:     ctx.reusableOpenproxyRecord.IsProxy,
-			IsVPN:       ctx.reusableOpenproxyRecord.IsVPN,
-			IsTor:       ctx.reusableOpenproxyRecord.IsTor,
-			IsHosting:   ctx.reusableOpenproxyRecord.IsHosting,
-			IsCDN:       ctx.reusableOpenproxyRecord.IsCDN,
-			IsSchool:    ctx.reusableOpenproxyRecord.IsSchool,
-			IsAnonymous: ctx.reusableOpenproxyRecord.IsAnonymous,
-		}
-	}
-
-	applySchoolASNMatch(record)
-
-	if applyASNProxyOverlay(record, ctx.asnOverlay) {
-		ctx.stats.asnOverlayHits++
-	}
-
-	if !record.Proxy.IsProxy && record.ASN.Number != 0 && ctx.badASN.Contains(record.ASN.Number) {
-		ctx.stats.badASNHits++
-		record.Proxy.IsProxy = true
-		record.Proxy.IsHosting = true
-		record.Proxy.IsAnonymous = true
 	}
 }

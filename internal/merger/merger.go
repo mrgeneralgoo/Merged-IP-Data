@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"runtime/debug"
+	"sort"
 	"time"
 
 	"merged-ip-data/internal/config"
@@ -15,9 +17,22 @@ import (
 
 	"github.com/maxmind/mmdbwriter"
 	"github.com/maxmind/mmdbwriter/mmdbtype"
+	"go4.org/netipx"
 )
 
 const maxMergeWorkers = 8
+const mergeGCPercent = 75
+
+// tuneMergeGC lowers the default heap-growth target during the memory-heavy
+// merge while respecting any tighter GOGC setting chosen by the caller.
+func tuneMergeGC() func() {
+	previous := debug.SetGCPercent(mergeGCPercent)
+	if previous <= mergeGCPercent {
+		debug.SetGCPercent(previous)
+		return func() {}
+	}
+	return func() { debug.SetGCPercent(previous) }
+}
 
 // logMemStats logs current memory statistics for profiling
 func logMemStats(phase string) {
@@ -75,20 +90,14 @@ type Merger struct {
 
 	stats Stats
 
-	// Reusable records for lookups to reduce allocations during merge
-	reusableIPinfoRecord      reader.IPinfoLiteRecord
-	reusableGeoLiteASNRecord  reader.GeoLite2ASNRecord
-	reusableRouteViewsRecord  reader.RouteViewsASNRecord
-	reusableGeoWhoisRecord    reader.GeoWhoisCountryRecord
-	reusableQQWryRecord       reader.QQWryRecord
-	reusableGeoLiteCityRecord reader.GeoLite2CityRecord
-	reusableOpenproxyDBRecord reader.OpenproxyDBRecord
+	// Effective GeoLite networks with primary city/country data, coalesced into
+	// sorted ranges for efficient DB-IP gap processing.
+	geoPrimaryRanges []netipx.IPRange
 
-	// ASN lookup cache to avoid redundant lookups for adjacent networks
-	cachedASN        ASNRecord
-	cachedASNNetwork *net.IPNet
-	cachedASNSource  asnSource
-	cachedASNValid   bool
+	// Reusable records for point-lookup sources that do not expose iterable
+	// boundaries suitable for the merge.
+	reusableGeoWhoisRecord reader.GeoWhoisCountryRecord
+	reusableQQWryRecord    reader.QQWryRecord
 }
 
 // Stats holds merge statistics
@@ -113,15 +122,6 @@ type Stats struct {
 	ICloudPrivateRelayRangesInserted int64
 	AnycastPrefixesInserted          int64
 }
-
-type asnSource uint8
-
-const (
-	asnSourceNone asnSource = iota
-	asnSourceIPinfo
-	asnSourceGeoLite
-	asnSourceRouteViews
-)
 
 // New creates a new Merger instance
 func New() (*Merger, error) {
@@ -367,9 +367,18 @@ func (m *Merger) Close() error {
 
 // Merge performs the database merge operation
 func (m *Merger) Merge() error {
+	restoreGC := tuneMergeGC()
+	defer restoreGC()
+
 	fmt.Println("Starting database merge...")
 	startTime := time.Now()
 	logMemStats("Start")
+
+	fmt.Println("Processing ASN networks with exact source boundaries...")
+	if err := m.processASNNetworks(); err != nil {
+		return fmt.Errorf("failed to process ASN networks: %w", err)
+	}
+	logMemStats("After ASN networks")
 
 	numWorkers := mergeWorkerCount()
 	fmt.Printf("Processing GeoLite2-City networks (primary source) with %d workers...\n", numWorkers)
@@ -386,13 +395,20 @@ func (m *Merger) Merge() error {
 	if err := m.processDBIPNetworks(); err != nil {
 		return fmt.Errorf("failed to process DB-IP: %w", err)
 	}
+	m.geoPrimaryRanges = nil
 	logMemStats("After DB-IP")
 
-	fmt.Println("Processing ASN proxy overlays (direct ASN network insertion)...")
-	if err := m.processASNOverlayNetworks(); err != nil {
-		return fmt.Errorf("failed to process ASN proxy overlays: %w", err)
+	// DB-IP merges create many short-lived maps while the long-lived tree is
+	// already large. Reclaim them before overlay phases so the heap-growth
+	// target does not allow transient overlay allocations to drive peak RSS.
+	runtime.GC()
+	logMemStats("After GC (Phase 2)")
+
+	fmt.Println("Processing GeoLite2 Country fallback networks...")
+	if err := m.processCountryFallbackNetworks(); err != nil {
+		return fmt.Errorf("failed to process GeoLite2 Country fallback: %w", err)
 	}
-	logMemStats("After ASN proxy overlays")
+	logMemStats("After GeoLite2 Country fallback")
 
 	fmt.Println("Processing OpenProxyDB CIDR ranges (direct CIDR insertion)...")
 	if err := m.processOpenProxyDBCIDRRanges(); err != nil {
@@ -441,20 +457,14 @@ func (m *Merger) Merge() error {
 // processGeoLiteCityNetworksParallel processes GeoLite2-City networks using parallel workers.
 // This significantly speeds up processing on multi-core systems by:
 // 1. Reading networks from GeoLite2-City sequentially (iterator is not thread-safe)
-// 2. Processing enrichment (ASN, QQWry, etc.) in parallel via worker pool
+// 2. Processing country/QQWry enrichment and record encoding in parallel
 // 3. Inserting results into the tree sequentially (tree is not thread-safe)
 func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 	// Create worker pool
 	pool := newWorkerPool(
 		numWorkers,
-		m.ipinfoLite,
-		m.geoLiteASN,
-		m.routeViewsASN,
 		m.geoWhoisCountry,
 		m.qqwry,
-		m.openproxyDB,
-		m.badASN,
-		m.asnOverlay,
 	)
 
 	// Start workers
@@ -468,7 +478,7 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 	go func() {
 		defer close(insertDone)
 		for result := range pool.results() {
-			if err := m.tree.Insert(result.network, result.mmdbRecord); err != nil {
+			if err := m.insertMMDBMapWithMerge(result.network, result.mmdbRecord); err != nil {
 				if isSkippableInsertError(err) {
 					continue
 				}
@@ -487,12 +497,22 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 
 	// Read networks and submit to worker pool
 	networks := m.geoLiteCity.Networks()
+	var decodeErr error
+	primaryRanges := make([]netipx.IPRange, 0, 4096)
 	for networks.Next() {
 		var geoRecord reader.GeoLite2CityRecord
 		network, err := networks.Network(&geoRecord)
 		if err != nil {
-			fmt.Printf("Warning: failed to read network: %v\n", err)
-			continue
+			decodeErr = fmt.Errorf("failed to read GeoLite2-City network: %w", err)
+			break
+		}
+		if geoRecord.HasPrimaryGeoData() {
+			prefix, ok := netipx.FromStdIPNet(network)
+			if !ok {
+				decodeErr = fmt.Errorf("invalid GeoLite2-City network %s", network)
+				break
+			}
+			primaryRanges = appendCoalescedIPRange(primaryRanges, netipx.RangeOfPrefix(prefix))
 		}
 
 		pool.submit(workItem{
@@ -514,6 +534,10 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 	if err := networks.Err(); err != nil {
 		return err
 	}
+	if decodeErr != nil {
+		return decodeErr
+	}
+	m.geoPrimaryRanges = primaryRanges
 
 	if insertErr != nil {
 		return insertErr
@@ -523,14 +547,8 @@ func (m *Merger) processGeoLiteCityNetworksParallel(numWorkers int) error {
 	workerStats := pool.aggregateStats()
 	m.stats.TotalNetworks = workerStats.TotalNetworks
 	m.stats.GeoLiteCityHits = workerStats.GeoLiteCityHits
-	m.stats.GeoLiteASNHits = workerStats.GeoLiteASNHits
-	m.stats.IPinfoLiteHits = workerStats.IPinfoLiteHits
-	m.stats.RouteViewsASNHits = workerStats.RouteViewsASNHits
 	m.stats.GeoWhoisCountryHits = workerStats.GeoWhoisCountryHits
 	m.stats.QQWryHits = workerStats.QQWryHits
-	m.stats.OpenproxyDBHits = workerStats.OpenproxyDBHits
-	m.stats.ASNOverlayHits = workerStats.ASNOverlayHits
-	m.stats.BadASNHits = workerStats.BadASNHits
 	m.stats.EmptyRecords = workerStats.EmptyRecords
 	m.stats.ProcessedNetworks = insertedCount
 
@@ -555,47 +573,98 @@ func (m *Merger) processDBIPReader(r *reader.Reader) error {
 		var dbipRecord reader.DBIPCityRecord
 		network, err := networks.Network(&dbipRecord)
 		if err != nil {
-			fmt.Printf("Warning: failed to read DB-IP network: %v\n", err)
-			continue
+			return fmt.Errorf("failed to read DB-IP network: %w", err)
 		}
 
 		if !dbipRecord.HasGeoData() {
 			continue
 		}
 
-		ip := network.IP
-
-		// Use reusable record to check if GeoLite2 has data for this IP
-		m.reusableGeoLiteCityRecord.Reset()
-		if err := m.geoLiteCity.LookupTo(ip, &m.reusableGeoLiteCityRecord); err == nil && m.reusableGeoLiteCityRecord.HasPrimaryGeoData() {
-			continue
-		}
-
-		m.stats.TotalNetworks++
-
-		record.Reset()
-		m.buildMergedRecordFromDBIP(network, &dbipRecord, &record)
-
-		if record.IsEmpty() {
-			m.stats.EmptyRecords++
-			continue
-		}
-
-		if err := m.insertWithMerge(network, &record); err != nil {
-			// Silently skip reserved and aliased networks - these are expected
-			// when DB-IP data contains IANA special-purpose address ranges
-			if isSkippableInsertError(err) {
+		for _, prefix := range m.geoUncoveredPrefixes(network) {
+			uncovered := netipPrefixToIPNet(prefix)
+			if uncovered == nil {
 				continue
 			}
-			fmt.Printf("Warning: failed to insert DB-IP network %s: %v\n", network, err)
-			continue
+			m.stats.TotalNetworks++
+			record.Reset()
+			m.buildMergedRecordFromDBIP(uncovered, &dbipRecord, &record)
+			if record.IsEmpty() {
+				m.stats.EmptyRecords++
+				continue
+			}
+			if err := m.insertWithMerge(uncovered, &record); err != nil {
+				if isSkippableInsertError(err) {
+					continue
+				}
+				return fmt.Errorf("failed to insert DB-IP network %s: %w", uncovered, err)
+			}
+			m.stats.DBIPHits++
+			m.stats.ProcessedNetworks++
 		}
-
-		m.stats.DBIPHits++
-		m.stats.ProcessedNetworks++
 	}
 
 	return networks.Err()
+}
+
+func appendCoalescedIPRange(ranges []netipx.IPRange, next netipx.IPRange) []netipx.IPRange {
+	if !next.IsValid() {
+		return ranges
+	}
+	if len(ranges) == 0 {
+		return append(ranges, next)
+	}
+	last := ranges[len(ranges)-1]
+	if last.To().BitLen() == next.From().BitLen() &&
+		(next.From().Compare(last.To()) <= 0 || last.To().Next() == next.From()) {
+		if next.To().Compare(last.To()) > 0 {
+			ranges[len(ranges)-1] = netipx.IPRangeFrom(last.From(), next.To())
+		}
+		return ranges
+	}
+	return append(ranges, next)
+}
+
+func (m *Merger) geoUncoveredPrefixes(network *net.IPNet) []netip.Prefix {
+	prefix, ok := netipx.FromStdIPNet(network)
+	if !ok {
+		return nil
+	}
+	target := netipx.RangeOfPrefix(prefix)
+	start, end := target.From(), target.To()
+	i := sort.Search(len(m.geoPrimaryRanges), func(i int) bool {
+		return m.geoPrimaryRanges[i].To().Compare(start) >= 0
+	})
+	var result []netip.Prefix
+	cursor := start
+	for ; i < len(m.geoPrimaryRanges); i++ {
+		covered := m.geoPrimaryRanges[i]
+		if covered.From().Compare(end) > 0 {
+			break
+		}
+		if covered.From().Compare(cursor) > 0 {
+			result = netipx.IPRangeFrom(cursor, covered.From().Prev()).AppendPrefixes(result)
+		}
+		if covered.To().Compare(end) >= 0 {
+			return result
+		}
+		if covered.To().Compare(cursor) >= 0 {
+			cursor = covered.To().Next()
+		}
+	}
+	if cursor.IsValid() && cursor.Compare(end) <= 0 {
+		result = netipx.IPRangeFrom(cursor, end).AppendPrefixes(result)
+	}
+	return result
+}
+
+func networkContains(outer, inner *net.IPNet) bool {
+	if outer == nil || inner == nil {
+		return false
+	}
+	outerOnes, outerBits := outer.Mask.Size()
+	innerOnes, innerBits := inner.Mask.Size()
+	return outerOnes >= 0 && innerOnes >= 0 && outerBits == innerBits &&
+		outerOnes <= innerOnes && outer.Contains(inner.IP)
 }
 
 // buildMergedRecordFromDBIP creates a merged record using DB-IP as primary geo source.
@@ -630,19 +699,58 @@ func (m *Merger) buildMergedRecordFromDBIP(network *net.IPNet, dbipRecord *reade
 			}
 		}
 
-		if dbipRecord.State1 != "" {
-			record.Subdivisions = []SubdivisionRecord{
-				{
-					Names: map[string]string{"en": dbipRecord.State1},
-				},
-			}
+		if dbipRecord.State1 != "" || dbipRecord.State2 != "" {
+			record.Subdivisions = subdivisionsFromDBIP(dbipRecord)
 		}
 	}
 
-	m.enrichWithASNData(network.IP, record)
 	m.enrichWithCountryFallback(network.IP, record)
 	m.enrichWithQQWryData(network.IP, record)
-	m.enrichWithProxyData(network.IP, record)
+}
+
+func subdivisionsFromDBIP(record *reader.DBIPCityRecord) []SubdivisionRecord {
+	subdivisions := make([]SubdivisionRecord, 0, 2)
+	if record.State1 != "" {
+		subdivisions = append(subdivisions, SubdivisionRecord{Names: map[string]string{"en": record.State1}})
+	}
+	if record.State2 != "" {
+		subdivisions = append(subdivisions, SubdivisionRecord{Names: map[string]string{"en": record.State2}})
+	}
+	return subdivisions
+}
+
+func (m *Merger) processCountryFallbackNetworks() error {
+	networks := m.geoWhoisCountry.Networks()
+	processed, changed, skipped := 0, 0, 0
+	for networks.Next() {
+		var source reader.GeoWhoisCountryRecord
+		network, err := networks.Network(&source)
+		if err != nil {
+			return fmt.Errorf("failed to read GeoLite2 Country network: %w", err)
+		}
+		if !source.HasCountry() {
+			continue
+		}
+		fallback := (&MergedRecord{Country: CountryRecord{ISOCode: source.CountryCode}}).ToMMDBType()
+		didChange, err := m.insertMMDBMapWithMergeTracked(network, fallback)
+		if err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			return fmt.Errorf("failed to insert GeoLite2 Country network %s: %w", network, err)
+		}
+		processed++
+		if didChange {
+			changed++
+		}
+	}
+	if err := networks.Err(); err != nil {
+		return err
+	}
+	m.stats.GeoWhoisCountryHits += int64(changed)
+	fmt.Printf("GeoLite2 Country fallback networks: %d processed, %d changed, %d skipped\n", processed, changed, skipped)
+	return nil
 }
 
 // enrichWithCountryFallback adds country information from GeoLite2 Country when country is missing.
@@ -702,119 +810,6 @@ func (m *Merger) enrichWithQQWryData(ip net.IP, record *MergedRecord) {
 	}
 }
 
-// enrichWithASNData adds ASN information from IPinfo Lite (primary), GeoLite2-ASN (secondary), or Origin ASN (tertiary).
-// Uses caching to avoid redundant lookups for IPs within the same ASN network.
-func (m *Merger) enrichWithASNData(ip net.IP, record *MergedRecord) {
-	// Check cache first - if IP is within cached ASN network, reuse the result
-	if m.cachedASNValid && m.cachedASNNetwork != nil && m.cachedASNNetwork.Contains(ip) {
-		if m.cachedASN.Number != 0 {
-			record.ASN = m.cachedASN
-			m.incrementASNHit(m.cachedASNSource)
-		}
-		return
-	}
-
-	// Cache miss - perform lookups
-	m.cachedASNValid = false
-	m.cachedASNNetwork = nil
-	m.cachedASNSource = asnSourceNone
-
-	// Priority 1: IPinfo Lite (includes as_domain)
-	m.reusableIPinfoRecord.Reset()
-	if network, lookupOK, err := m.ipinfoLite.LookupNetworkTo(ip, &m.reusableIPinfoRecord); err == nil && lookupOK && m.reusableIPinfoRecord.HasASN() {
-		m.stats.IPinfoLiteHits++
-		record.ASN = ASNRecord{
-			Number:       m.reusableIPinfoRecord.GetASNumber(),
-			Organization: m.reusableIPinfoRecord.ASName,
-			Domain:       m.reusableIPinfoRecord.ASDomain,
-		}
-		m.cachedASN = record.ASN
-		m.cachedASNNetwork = network
-		m.cachedASNSource = asnSourceIPinfo
-		m.cachedASNValid = true
-		return
-	}
-
-	// Priority 2: GeoLite2-ASN
-	m.reusableGeoLiteASNRecord.Reset()
-	if network, lookupOK, err := m.geoLiteASN.LookupNetworkTo(ip, &m.reusableGeoLiteASNRecord); err == nil && lookupOK && m.reusableGeoLiteASNRecord.HasASN() {
-		m.stats.GeoLiteASNHits++
-		record.ASN = ASNRecord{
-			Number:       m.reusableGeoLiteASNRecord.AutonomousSystemNumber,
-			Organization: m.reusableGeoLiteASNRecord.AutonomousSystemOrganization,
-		}
-		m.cachedASN = record.ASN
-		m.cachedASNNetwork = network
-		m.cachedASNSource = asnSourceGeoLite
-		m.cachedASNValid = true
-		return
-	}
-
-	// Priority 3: Origin ASN
-	m.reusableRouteViewsRecord.Reset()
-	if network, lookupOK, err := m.routeViewsASN.LookupNetworkTo(ip, &m.reusableRouteViewsRecord); err == nil && lookupOK && m.reusableRouteViewsRecord.HasASN() {
-		m.stats.RouteViewsASNHits++
-		record.ASN = ASNRecord{
-			Number:       m.reusableRouteViewsRecord.AutonomousSystemNumber,
-			Organization: m.reusableRouteViewsRecord.AutonomousSystemOrganization,
-		}
-		m.cachedASN = record.ASN
-		m.cachedASNNetwork = network
-		m.cachedASNSource = asnSourceRouteViews
-		m.cachedASNValid = true
-		return
-	}
-
-	// No ASN found - cache the miss with empty record
-	m.cachedASN = ASNRecord{}
-	m.cachedASNSource = asnSourceNone
-	m.cachedASNValid = true
-}
-
-func (m *Merger) incrementASNHit(source asnSource) {
-	switch source {
-	case asnSourceIPinfo:
-		m.stats.IPinfoLiteHits++
-	case asnSourceGeoLite:
-		m.stats.GeoLiteASNHits++
-	case asnSourceRouteViews:
-		m.stats.RouteViewsASNHits++
-	}
-}
-
-// enrichWithProxyData adds proxy/anonymity information from OpenProxyDB, with
-// a bad-ASN fallback: if OpenProxyDB did not flag the IP as a proxy but the
-// ASN resolved earlier is in the bad ASN list, overlay IsProxy/IsHosting/
-// IsAnonymous onto whatever proxy record is already present.
-func (m *Merger) enrichWithProxyData(ip net.IP, record *MergedRecord) {
-	m.reusableOpenproxyDBRecord.Reset()
-	if m.openproxyDB.LookupTo(ip, &m.reusableOpenproxyDBRecord) {
-		m.stats.OpenproxyDBHits++
-		record.Proxy = ProxyRecord{
-			IsProxy:     m.reusableOpenproxyDBRecord.IsProxy,
-			IsVPN:       m.reusableOpenproxyDBRecord.IsVPN,
-			IsTor:       m.reusableOpenproxyDBRecord.IsTor,
-			IsHosting:   m.reusableOpenproxyDBRecord.IsHosting,
-			IsCDN:       m.reusableOpenproxyDBRecord.IsCDN,
-			IsSchool:    m.reusableOpenproxyDBRecord.IsSchool,
-			IsAnonymous: m.reusableOpenproxyDBRecord.IsAnonymous,
-		}
-	}
-
-	applySchoolASNMatch(record)
-
-	if applyASNProxyOverlay(record, m.asnOverlay) {
-		m.stats.ASNOverlayHits++
-	}
-
-	if !record.Proxy.IsProxy && record.ASN.Number != 0 && m.badASN.Contains(record.ASN.Number) {
-		m.stats.BadASNHits++
-		record.Proxy.IsProxy = true
-		record.Proxy.IsHosting = true
-		record.Proxy.IsAnonymous = true
-	}
-}
-
 func applyASNProxyOverlay(record *MergedRecord, asnOverlay *reader.ASNOverlayReader) bool {
 	if record.ASN.Number == 0 || asnOverlay == nil {
 		return false
@@ -856,63 +851,196 @@ func proxyRecordFromOpenproxy(record reader.OpenproxyDBRecord) ProxyRecord {
 	return proxy
 }
 
-// processASNOverlayNetworks directly overlays IPinfo ASN networks whose ASNs
-// appear in the configured ASN proxy lists. IPinfo Lite is the primary ASN
-// source for this project; lookup-time enrichment still applies overlays when
-// records fall back to GeoLite2-ASN or Origin ASN.
-func (m *Merger) processASNOverlayNetworks() error {
-	if m.asnOverlay == nil || m.asnOverlay.Count() == 0 {
-		fmt.Println("ASN proxy overlay networks: 0 inserted, 0 skipped")
-		return nil
+// processASNNetworks inserts each ASN source on its native network boundaries.
+// Sources are processed from lowest to highest priority so later records
+// replace the ASN (and ASN-derived proxy flags) without point-sampling errors.
+func (m *Merger) processASNNetworks() error {
+	if err := m.processRouteViewsASNNetworks(); err != nil {
+		return err
 	}
+	if err := m.processGeoLiteASNNetworks(); err != nil {
+		return err
+	}
+	return m.processIPinfoASNNetworks()
+}
 
-	networks := m.ipinfoLite.Networks()
-	inserted := 0
-	skipped := 0
-
+func (m *Merger) processRouteViewsASNNetworks() error {
+	networks := m.routeViewsASN.Networks()
+	inserted, skipped, shadowed := 0, 0, 0
+	var ipinfoRecord reader.IPinfoLiteRecord
+	var geoRecord reader.GeoLite2ASNRecord
 	for networks.Next() {
-		var record reader.IPinfoLiteRecord
-		network, err := networks.Network(&record)
+		var source reader.RouteViewsASNRecord
+		network, err := networks.Network(&source)
 		if err != nil {
-			fmt.Printf("Warning: failed to read IPinfo ASN network: %v\n", err)
-			skipped++
+			return fmt.Errorf("failed to read Origin ASN network: %w", err)
+		}
+		if !source.HasASN() {
 			continue
 		}
-		if !record.HasASN() {
+		ipinfoRecord.Reset()
+		if higher, ok, err := m.ipinfoLite.LookupNetworkTo(network.IP, &ipinfoRecord); err != nil {
+			return fmt.Errorf("failed to check IPinfo coverage for Origin ASN network %s: %w", network, err)
+		} else if ok && ipinfoRecord.HasASN() && networkContains(higher, network) {
+			shadowed++
 			continue
 		}
-
-		overlay, ok := m.asnOverlay.Lookup(record.GetASNumber())
-		if !ok {
+		geoRecord.Reset()
+		if higher, ok, err := m.geoLiteASN.LookupNetworkTo(network.IP, &geoRecord); err != nil {
+			return fmt.Errorf("failed to check GeoLite2-ASN coverage for Origin ASN network %s: %w", network, err)
+		} else if ok && geoRecord.HasASN() && networkContains(higher, network) {
+			shadowed++
 			continue
 		}
-
-		proxy := proxyRecordFromOpenproxy(overlay)
-		proxyMMDB := proxy.toMMDBType()
-		if proxyMMDB == nil {
-			skipped++
-			continue
-		}
-
-		if err := m.insertProxyMap(network, proxyMMDB); err != nil {
+		asn := ASNRecord{Number: source.AutonomousSystemNumber, Organization: source.AutonomousSystemOrganization}
+		overlay, err := m.insertExactASN(network, asn)
+		if err != nil {
 			if isSkippableInsertError(err) {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert ASN proxy overlay network %s: %v\n", network, err)
-			skipped++
-			continue
+			return fmt.Errorf("failed to insert Origin ASN network %s: %w", network, err)
 		}
 		inserted++
+		m.stats.RouteViewsASNHits++
+		m.countASNDerivedFlags(asn, overlay)
 	}
-
 	if err := networks.Err(); err != nil {
 		return err
 	}
-
-	fmt.Printf("ASN proxy overlay networks: %d inserted, %d skipped\n", inserted, skipped)
-	m.stats.ASNOverlayNetworksInserted = int64(inserted)
+	fmt.Printf("  Origin ASN networks: %d inserted, %d shadowed, %d skipped\n", inserted, shadowed, skipped)
 	return nil
+}
+
+func (m *Merger) processGeoLiteASNNetworks() error {
+	networks := m.geoLiteASN.Networks()
+	inserted, skipped, shadowed := 0, 0, 0
+	var ipinfoRecord reader.IPinfoLiteRecord
+	for networks.Next() {
+		var source reader.GeoLite2ASNRecord
+		network, err := networks.Network(&source)
+		if err != nil {
+			return fmt.Errorf("failed to read GeoLite2-ASN network: %w", err)
+		}
+		if !source.HasASN() {
+			continue
+		}
+		ipinfoRecord.Reset()
+		if higher, ok, err := m.ipinfoLite.LookupNetworkTo(network.IP, &ipinfoRecord); err != nil {
+			return fmt.Errorf("failed to check IPinfo coverage for GeoLite2-ASN network %s: %w", network, err)
+		} else if ok && ipinfoRecord.HasASN() && networkContains(higher, network) {
+			shadowed++
+			continue
+		}
+		asn := ASNRecord{Number: source.AutonomousSystemNumber, Organization: source.AutonomousSystemOrganization}
+		overlay, err := m.insertExactASN(network, asn)
+		if err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			return fmt.Errorf("failed to insert GeoLite2-ASN network %s: %w", network, err)
+		}
+		inserted++
+		m.stats.GeoLiteASNHits++
+		m.countASNDerivedFlags(asn, overlay)
+	}
+	if err := networks.Err(); err != nil {
+		return err
+	}
+	fmt.Printf("  GeoLite2-ASN networks: %d inserted, %d shadowed, %d skipped\n", inserted, shadowed, skipped)
+	return nil
+}
+
+func (m *Merger) processIPinfoASNNetworks() error {
+	networks := m.ipinfoLite.Networks()
+	inserted, skipped := 0, 0
+	for networks.Next() {
+		var source reader.IPinfoLiteRecord
+		network, err := networks.Network(&source)
+		if err != nil {
+			return fmt.Errorf("failed to read IPinfo ASN network: %w", err)
+		}
+		if !source.HasASN() {
+			continue
+		}
+		asn := ASNRecord{Number: source.GetASNumber(), Organization: source.ASName, Domain: source.ASDomain}
+		overlay, err := m.insertExactASN(network, asn)
+		if err != nil {
+			if isSkippableInsertError(err) {
+				skipped++
+				continue
+			}
+			return fmt.Errorf("failed to insert IPinfo ASN network %s: %w", network, err)
+		}
+		inserted++
+		m.stats.IPinfoLiteHits++
+		m.countASNDerivedFlags(asn, overlay)
+	}
+	if err := networks.Err(); err != nil {
+		return err
+	}
+	fmt.Printf("  IPinfo ASN networks: %d inserted, %d skipped\n", inserted, skipped)
+	return nil
+}
+
+// insertExactASN replaces the prior, lower-priority ASN and its derived proxy
+// flags. Exact proxy feeds are inserted later and therefore cannot be removed
+// by this source-priority phase.
+func (m *Merger) insertExactASN(network *net.IPNet, asn ASNRecord) (ProxyRecord, error) {
+	proxy := m.asnDerivedProxy(asn)
+	asnMMDB := asn.toMMDBType()
+	proxyMMDB := proxy.toMMDBType()
+
+	err := m.tree.InsertFunc(network, func(existing mmdbtype.DataType) (mmdbtype.DataType, error) {
+		if existing == nil {
+			result := makeMMDBMap(2)
+			result[keyASN] = asnMMDB
+			if proxyMMDB != nil {
+				result[keyProxy] = proxyMMDB
+			}
+			return result, nil
+		}
+		existingMap, ok := existing.(mmdbtype.Map)
+		if !ok {
+			result := mmdbtype.Map{keyASN: asnMMDB}
+			if proxyMMDB != nil {
+				result[keyProxy] = proxyMMDB
+			}
+			return result, nil
+		}
+		result := shallowCopyMMDBMap(existingMap, 1)
+		result[keyASN] = asnMMDB
+		if proxyMMDB == nil {
+			delete(result, keyProxy)
+		} else {
+			result[keyProxy] = proxyMMDB
+		}
+		return result, nil
+	})
+	return proxy, err
+}
+
+func (m *Merger) asnDerivedProxy(asn ASNRecord) ProxyRecord {
+	record := MergedRecord{ASN: asn}
+	applySchoolASNMatch(&record)
+	applyASNProxyOverlay(&record, m.asnOverlay)
+	if !record.Proxy.IsProxy && m.badASN.Contains(asn.Number) {
+		record.Proxy.IsProxy = true
+		record.Proxy.IsHosting = true
+		record.Proxy.IsAnonymous = true
+	}
+	return record.Proxy
+}
+
+func (m *Merger) countASNDerivedFlags(asn ASNRecord, proxy ProxyRecord) {
+	if _, ok := m.asnOverlay.Lookup(asn.Number); ok {
+		m.stats.ASNOverlayHits++
+		m.stats.ASNOverlayNetworksInserted++
+	}
+	if m.badASN.Contains(asn.Number) && proxy.IsProxy && proxy.IsHosting {
+		m.stats.BadASNHits++
+	}
 }
 
 // processICloudPrivateRelayRanges directly overlays every Apple-published
@@ -945,9 +1073,7 @@ func (m *Merger) processICloudPrivateRelayRanges() error {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert iCloud Private Relay range %s: %v\n", prefix, err)
-			skipped++
-			continue
+			return fmt.Errorf("failed to insert iCloud Private Relay range %s: %w", prefix, err)
 		}
 		inserted++
 	}
@@ -997,9 +1123,7 @@ func (m *Merger) processOpenProxyDBCIDRRanges() error {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert OpenProxyDB CIDR range %s: %v\n", cidrRange.Prefix, err)
-			skipped++
-			continue
+			return fmt.Errorf("failed to insert OpenProxyDB CIDR range %s: %w", cidrRange.Prefix, err)
 		}
 		inserted++
 	}
@@ -1039,9 +1163,7 @@ func (m *Merger) processVPNProviderRanges() error {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert VPN provider range %s: %v\n", cidrRange.Prefix, err)
-			skipped++
-			continue
+			return fmt.Errorf("failed to insert VPN provider range %s: %w", cidrRange.Prefix, err)
 		}
 		inserted++
 	}
@@ -1076,9 +1198,7 @@ func (m *Merger) processAnycastPrefixes() error {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert anycast prefix %s: %v\n", prefix, err)
-			skipped++
-			continue
+			return fmt.Errorf("failed to insert anycast prefix %s: %w", prefix, err)
 		}
 		inserted++
 	}
@@ -1132,9 +1252,7 @@ func (m *Merger) processSingleProxyIPs() error {
 				skipped++
 				continue
 			}
-			fmt.Printf("Warning: failed to insert single proxy IP %s: %v\n", addr, err)
-			skipped++
-			continue
+			return fmt.Errorf("failed to insert single proxy IP %s: %w", addr, err)
 		}
 		inserted++
 	}
@@ -1182,8 +1300,20 @@ func (m *Merger) insertProxyMap(network *net.IPNet, proxyMMDB mmdbtype.Map) erro
 			return mmdbtype.Map{keyProxy: proxyMMDB}, nil
 		}
 
-		copied := existingMap.Copy().(mmdbtype.Map)
-		if prev, hasPrev := copied[keyProxy].(mmdbtype.Map); hasPrev {
+		// Only the top-level proxy value changes. Nested geo/ASN values are
+		// immutable after insertion and can safely be shared. A deep Copy here
+		// multiplies allocations for every leaf intersected by a broad overlay.
+		if prev, hasPrev := existingMap[keyProxy].(mmdbtype.Map); hasPrev {
+			if proxyMapContainsAll(prev, proxyMMDB) {
+				return existing, nil
+			}
+		}
+
+		copied := makeMMDBMap(len(existingMap))
+		for key, value := range existingMap {
+			copied[key] = value
+		}
+		if prev, hasPrev := existingMap[keyProxy].(mmdbtype.Map); hasPrev {
 			copied[keyProxy] = unionProxyMaps(prev, proxyMMDB)
 		} else {
 			copied[keyProxy] = proxyMMDB
@@ -1200,51 +1330,103 @@ func isSkippableInsertError(err error) bool {
 
 // insertWithMerge inserts a record, merging with existing data if present
 func (m *Merger) insertWithMerge(network *net.IPNet, record *MergedRecord) error {
-	return m.tree.InsertFunc(network, func(existing mmdbtype.DataType) (mmdbtype.DataType, error) {
+	return m.insertMMDBMapWithMerge(network, record.ToMMDBType())
+}
+
+func (m *Merger) insertMMDBMapWithMerge(network *net.IPNet, newMap mmdbtype.Map) error {
+	_, err := m.insertMMDBMapWithMergeTracked(network, newMap)
+	return err
+}
+
+func (m *Merger) insertMMDBMapWithMergeTracked(network *net.IPNet, newMap mmdbtype.Map) (bool, error) {
+	changed := false
+	err := m.tree.InsertFunc(network, func(existing mmdbtype.DataType) (mmdbtype.DataType, error) {
 		if existing == nil {
-			return record.ToMMDBType(), nil
+			changed = true
+			return newMap, nil
 		}
 
 		existingMap, ok := existing.(mmdbtype.Map)
 		if !ok {
-			return record.ToMMDBType(), nil
+			changed = true
+			return newMap, nil
 		}
 
-		newMap := record.ToMMDBType()
-		return mergeMMDBMaps(existingMap, newMap), nil
+		merged, didChange := mergeMMDBMapsChanged(existingMap, newMap)
+		changed = changed || didChange
+		return merged, nil
 	})
+	return changed, err
 }
 
 // mergeMMDBMaps merges two mmdbtype.Map values, with new values filling in missing fields
 func mergeMMDBMaps(existing, new mmdbtype.Map) mmdbtype.Map {
-	result := mmdbtype.Map{}
+	result, _ := mergeMMDBMapsChanged(existing, new)
+	return result
+}
 
-	for k, v := range existing {
-		result[k] = v
-	}
-
+func mergeMMDBMapsChanged(existing, new mmdbtype.Map) (mmdbtype.Map, bool) {
+	result := existing
+	changed := false
 	for k, v := range new {
 		existingValue, exists := result[k]
 		if !exists {
+			if !changed {
+				result = shallowCopyMMDBMap(existing, len(new))
+				changed = true
+			}
 			result[k] = v
 			continue
 		}
 		if k == keyProxy {
 			if existingProxy, ok := existingValue.(mmdbtype.Map); ok {
 				if newProxy, ok := v.(mmdbtype.Map); ok {
-					result[k] = unionProxyMaps(existingProxy, newProxy)
+					if !proxyMapContainsAll(existingProxy, newProxy) {
+						if !changed {
+							result = shallowCopyMMDBMap(existing, len(new))
+							changed = true
+						}
+						result[k] = unionProxyMaps(existingProxy, newProxy)
+					}
 				}
 			}
 			continue
 		}
 		if existingMap, ok := existingValue.(mmdbtype.Map); ok {
 			if newMap, ok := v.(mmdbtype.Map); ok {
-				result[k] = mergeMMDBMaps(existingMap, newMap)
+				merged, nestedChanged := mergeMMDBMapsChanged(existingMap, newMap)
+				if nestedChanged {
+					if !changed {
+						result = shallowCopyMMDBMap(existing, len(new))
+						changed = true
+					}
+					result[k] = merged
+				}
 			}
 		}
 	}
 
+	return result, changed
+}
+
+// shallowCopyMMDBMap copies only the map header and entries. Nested values are
+// immutable and deliberately shared.
+func shallowCopyMMDBMap(source mmdbtype.Map, extraCapacity int) mmdbtype.Map {
+	result := makeMMDBMap(len(source) + extraCapacity)
+	for key, value := range source {
+		result[key] = value
+	}
 	return result
+}
+
+func proxyMapContainsAll(existing, overlay mmdbtype.Map) bool {
+	for key, value := range overlay {
+		existingValue, ok := existing[key]
+		if !ok || !existingValue.Equal(value) {
+			return false
+		}
+	}
+	return true
 }
 
 // unionProxyMaps returns a fresh map containing the union of boolean flag keys

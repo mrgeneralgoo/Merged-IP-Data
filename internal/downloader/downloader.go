@@ -61,7 +61,12 @@ func (d *Downloader) DownloadAll(ctx context.Context) ([]Result, error) {
 		wg.Add(1)
 		go func(idx int, src config.DatabaseSource) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] = Result{Source: src, Error: ctx.Err()}
+				return
+			}
 			defer func() { <-sem }()
 
 			err := d.downloadWithRetry(ctx, src)

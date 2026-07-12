@@ -69,6 +69,11 @@ type OpenproxyDBReader struct {
 	// bounded by address bit length after cidrSet confirms a positive match.
 	cidrRecords map[netip.Prefix]OpenproxyDBRecord
 
+	// Track which prefix lengths actually occur so positive CIDR lookups do
+	// not construct and probe every possible prefix length.
+	cidrBits4 [33]bool
+	cidrBits6 [129]bool
+
 	// icloudPrivateRelayRanges stores the source CIDRs from Apple's iCloud
 	// Private Relay egress list so the merger can overlay them exactly.
 	icloudPrivateRelayRanges []netip.Prefix
@@ -212,7 +217,11 @@ func (r *OpenproxyDBReader) parse(file *os.File) error {
 			if err != nil {
 				continue
 			}
-			r.singleIPs[addr.Unmap()] = record
+			addr = addr.Unmap()
+			if existing, ok := r.singleIPs[addr]; ok {
+				record = mergeOpenproxyRecords(existing, record)
+			}
+			r.singleIPs[addr] = record
 		}
 	}
 
@@ -226,17 +235,15 @@ func parseBool(s string) bool {
 }
 
 func canonicalPrefix(prefix netip.Prefix) netip.Prefix {
+	// Mask first. An address that happens to be IPv4-mapped does not imply a
+	// prefix shorter than /96 is an IPv4 prefix; unmapping such a prefix would
+	// incorrectly broaden it (for example, /80 to all IPv4 addresses).
+	prefix = prefix.Masked()
 	addr := prefix.Addr()
 	bits := prefix.Bits()
-	if addr.Is4In6() {
+	if addr.Is4In6() && bits >= 96 {
 		addr = addr.Unmap()
-		if bits >= 96 {
-			bits -= 96
-		} else {
-			bits = 0
-		}
-	} else {
-		addr = addr.Unmap()
+		bits -= 96
 	}
 	return netip.PrefixFrom(addr, bits).Masked()
 }
@@ -259,6 +266,11 @@ func (r *OpenproxyDBReader) addCIDRRangeWithSource(prefix netip.Prefix, record O
 		record = mergeOpenproxyRecords(existing, record)
 	}
 	r.cidrRecords[prefix] = record
+	if prefix.Addr().Is4() {
+		r.cidrBits4[prefix.Bits()] = true
+	} else {
+		r.cidrBits6[prefix.Bits()] = true
+	}
 }
 
 func (r *OpenproxyDBReader) rebuildCIDRSet() error {
@@ -266,15 +278,6 @@ func (r *OpenproxyDBReader) rebuildCIDRSet() error {
 		r.cidrSet = nil
 		return nil
 	}
-
-	sort.Slice(r.cidrRanges, func(i, j int) bool {
-		pi, pj := r.cidrRanges[i].prefix, r.cidrRanges[j].prefix
-		addrCmp := pi.Addr().Compare(pj.Addr())
-		if addrCmp != 0 {
-			return addrCmp < 0
-		}
-		return pi.Bits() > pj.Bits()
-	})
 
 	var builder netipx.IPSetBuilder
 	for i := range r.cidrRanges {
@@ -366,11 +369,23 @@ func (r *OpenproxyDBReader) findInCIDR(addr netip.Addr) (OpenproxyDBRecord, bool
 		return OpenproxyDBRecord{}, false
 	}
 
-	bitLen := addr.BitLen()
-	for bits := bitLen; bits >= 0; bits-- {
-		prefix := netip.PrefixFrom(addr, bits).Masked()
-		if record, ok := r.cidrRecords[prefix]; ok {
-			return record, true
+	if addr.Is4() {
+		for bits := 32; bits >= 0; bits-- {
+			if !r.cidrBits4[bits] {
+				continue
+			}
+			if record, ok := r.cidrRecords[netip.PrefixFrom(addr, bits).Masked()]; ok {
+				return record, true
+			}
+		}
+	} else {
+		for bits := 128; bits >= 0; bits-- {
+			if !r.cidrBits6[bits] {
+				continue
+			}
+			if record, ok := r.cidrRecords[netip.PrefixFrom(addr, bits).Masked()]; ok {
+				return record, true
+			}
 		}
 	}
 	return OpenproxyDBRecord{}, false

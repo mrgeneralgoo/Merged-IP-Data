@@ -60,12 +60,17 @@ func Intern(s string) string {
 
 	if existing, ok := global.pool.Load(s); ok {
 		global.hits.Add(1)
+		global.savings.Add(int64(len(s)))
 		return existing.(string)
 	}
 
-	global.misses.Add(1)
-	global.savings.Add(int64(len(s)))
-	actual, _ := global.pool.LoadOrStore(s, s)
+	actual, loaded := global.pool.LoadOrStore(s, s)
+	if loaded {
+		global.hits.Add(1)
+		global.savings.Add(int64(len(s)))
+	} else {
+		global.misses.Add(1)
+	}
 	return actual.(string)
 }
 

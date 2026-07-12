@@ -1,10 +1,14 @@
 package merger
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 
+	"merged-ip-data/internal/reader"
+
 	"github.com/maxmind/mmdbwriter/mmdbtype"
+	"go4.org/netipx"
 )
 
 func TestWithNameClonesInput(t *testing.T) {
@@ -134,6 +138,22 @@ func TestMergeMMDBMapsRecursivelyMergesAndUnionsProxy(t *testing.T) {
 	}
 }
 
+func TestMergeMMDBMapsReturnsExistingMapWhenNothingChanges(t *testing.T) {
+	existing := mmdbtype.Map{
+		keyCountry: mmdbtype.Map{keyISOCode: mmdbtype.String("US")},
+		keyProxy:   mmdbtype.Map{keyIsVPN: mmdbtype.Bool(true)},
+	}
+	newMap := mmdbtype.Map{
+		keyCountry: mmdbtype.Map{keyISOCode: mmdbtype.String("CA")},
+		keyProxy:   mmdbtype.Map{keyIsVPN: mmdbtype.Bool(true)},
+	}
+
+	_, changed := mergeMMDBMapsChanged(existing, newMap)
+	if changed {
+		t.Fatal("merge allocated a new map even though priority rules made no changes")
+	}
+}
+
 func TestApplySchoolASNMatchMarksUniversityOrganization(t *testing.T) {
 	record := MergedRecord{
 		ASN: ASNRecord{
@@ -209,5 +229,37 @@ func TestNetipPrefixToIPNetHandlesIPv4AndIPv6(t *testing.T) {
 				t.Fatalf("network = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGeoUncoveredPrefixesReturnsOnlyCoverageGaps(t *testing.T) {
+	m := Merger{geoPrimaryRanges: []netipx.IPRange{
+		netipx.RangeOfPrefix(netip.MustParsePrefix("10.0.0.0/25")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("10.0.0.192/26")),
+	}}
+	_, network, err := net.ParseCIDR("10.0.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := m.geoUncoveredPrefixes(network)
+	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.128/26")}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("uncovered prefixes = %v, want %v", got, want)
+	}
+}
+
+func TestAppendCoalescedIPRangeMergesAdjacentCoverage(t *testing.T) {
+	var ranges []netipx.IPRange
+	ranges = appendCoalescedIPRange(ranges, netipx.RangeOfPrefix(netip.MustParsePrefix("10.0.0.0/25")))
+	ranges = appendCoalescedIPRange(ranges, netipx.RangeOfPrefix(netip.MustParsePrefix("10.0.0.128/25")))
+	if len(ranges) != 1 || ranges[0] != netipx.RangeOfPrefix(netip.MustParsePrefix("10.0.0.0/24")) {
+		t.Fatalf("coalesced ranges = %v, want 10.0.0.0/24", ranges)
+	}
+}
+
+func TestSubdivisionsFromDBIPPreservesBothLevels(t *testing.T) {
+	got := subdivisionsFromDBIP(&reader.DBIPCityRecord{State1: "California", State2: "Santa Clara County"})
+	if len(got) != 2 || got[0].Names["en"] != "California" || got[1].Names["en"] != "Santa Clara County" {
+		t.Fatalf("subdivisions = %#v, want both DB-IP subdivision levels", got)
 	}
 }

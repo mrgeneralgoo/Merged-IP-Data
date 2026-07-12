@@ -86,6 +86,16 @@ func (r *GeoLite2CityReader) LookupNetwork(ip net.IP) (*net.IPNet, *GeoLite2City
 	return network, &record, true, nil
 }
 
+// LookupNetworkTo looks up an IP into a pre-allocated record and returns the
+// effective network containing that record.
+func (r *GeoLite2CityReader) LookupNetworkTo(ip net.IP, record *GeoLite2CityRecord) (*net.IPNet, bool, error) {
+	network, ok, err := r.Reader.LookupNetwork(ip, record)
+	if err != nil {
+		return nil, false, err
+	}
+	return network, ok, nil
+}
+
 // HasGeoData checks if the record has meaningful geographic data
 func (r *GeoLite2CityRecord) HasGeoData() bool {
 	return r.City.GeonameID != 0 ||
