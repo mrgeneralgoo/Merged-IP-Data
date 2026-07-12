@@ -11,7 +11,7 @@ const (
 	DBIPCityIPv6URL        = IPLocationDBReleaseBaseURL + "/dbip-city-ipv6.mmdb"
 	RouteViewsASNURL       = IPLocationDBReleaseBaseURL + "/origin-asn.mmdb"
 	GeoWhoisCountryURL     = IPLocationDBReleaseBaseURL + "/geolite2-country.mmdb"
-	QQWryURL               = "https://cdn.jsdelivr.net/npm/qqwry.ipdb/qqwry.ipdb"
+	QQWryURL               = "https://github.com/nmgliangwei/qqwry.ipdb/releases/latest/download/qqwry.ipdb"
 	OpenproxyDBURL         = "https://github.com/NetworkCats/OpenProxyDB/releases/latest/download/proxy_blocks.csv"
 	ICloudPrivateRelayURL  = "https://mask-api.icloud.com/egress-ip-ranges.csv"
 	X4BVPNASNURL           = "https://github.com/X4BNet/lists_vpn/raw/refs/heads/main/input/vpn/ASN.txt"

@@ -12,7 +12,7 @@ A Go program that merges multiple IP geolocation databases into a single, compre
 | [DB-IP City](https://github.com/sapics/ip-location-db#city) | Supplementary geo data | IPv4 + IPv6 |
 | [Origin ASN](https://github.com/sapics/ip-location-db#asn) | ASN fallback (tertiary) | IPv4 + IPv6 |
 | [GeoLite2 Country](https://github.com/sapics/ip-location-db#country) | Country fallback | IPv4 + IPv6 |
-| [QQWry (Chunzhen)](https://github.com/metowolf/qqwry.ipdb) | Enhanced Chinese IP geolocation with native zh-CN names | IPv4 |
+| [QQWry (Chunzhen)](https://github.com/nmgliangwei/qqwry.ipdb) | Enhanced Chinese IP geolocation with native zh-CN names | IPv4 |
 | [OpenProxyDB](https://github.com/NetworkCats/OpenProxyDB) | Proxy, VPN, Tor, hosting, and CDN detection | IPv4 + IPv6 |
 | [iCloud Private Relay](https://mask-api.icloud.com/egress-ip-ranges.csv) | Proxy and VPN overlay for Apple iCloud Private Relay egress ranges | IPv4 + IPv6 |
 | [X4B VPN lists](https://github.com/X4BNet/lists_vpn) | VPN ASN, hosting ASN, and VPN/hosting CIDR overlays for provider and datacenter ranges | IPv4 |
